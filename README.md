@@ -4,7 +4,7 @@ A comprehensive learning journey from **Computer Architecture fundamentals** to 
 
 ## 📋 Learning Path Overview
 
-This learning path is designed to take you from foundational concepts to advanced HPC and ML systems programming. Each module builds upon the previous ones.
+This learning path is designed to take you from foundational concepts to advanced HPC and ML systems programming. Each module builds upon the previous ones. This is designed and content is created mostly by claude opus by referencing some papers, and mentioned repositories for code! Hope this helps people who are interesting in optimization of models, training and inference pipelines!
 
 ## 📁 Module Structure
 
