@@ -1,550 +1,820 @@
-# Audio Field Design: Waveforms, Spectrograms, and Codecs
+# Audio Field Design: A Comprehensive Guide
 
-## Audio Data Characteristics
+## Audio Data Fundamentals
 
-Audio data presents unique challenges for data loading:
+Before designing audio fields, we must understand audio data at a fundamental level.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    AUDIO DATA CHARACTERISTICS                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  PROPERTY             TYPICAL VALUES         STORAGE IMPACT             │
-│  ──────────────────────────────────────────────────────────────────────│
-│  Sample Rate          8-48 kHz               1.5-7 MB/min (16-bit)      │
-│  Bit Depth            16-32 bits             2-4 bytes/sample           │
-│  Channels             1-2 (mono/stereo)      1-2x size multiplier       │
-│  Duration             1-30+ seconds          Variable length            │
-│  Format               WAV, MP3, FLAC, etc    Decode overhead            │
-│                                                                          │
-│  DERIVED REPRESENTATIONS                                                 │
-│  ──────────────────────────────────────────────────────────────────────│
-│  Mel Spectrogram      (n_mels, time_steps)   80-128 × 100-1000         │
-│  MFCC                 (n_mfcc, time_steps)   13-40 × time              │
-│  EnCodec tokens       (codebooks, frames)    8-32 × frames             │
-│                                                                          │
-│  CHALLENGE: 1 hour of audio = 2.6 GB (16-bit, 48kHz, stereo)           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### What is Digital Audio?
 
-## Storage Strategy Decision Tree
+Digital audio is a sequence of **samples**: measurements of sound pressure (amplitude) taken at regular intervals.
 
 ```
-                    ┌─────────────────────┐
-                    │   Audio Storage     │
-                    │      Decision       │
-                    └──────────┬──────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              ▼                ▼                ▼
-       ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-       │   Raw PCM   │  │ Compressed  │  │Pre-computed │
-       │  Waveform   │  │   (FLAC/    │  │  Features   │
-       │             │  │   Opus)     │  │             │
-       └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-              │                │                │
-   ┌──────────┴──────────┐    │         ┌──────┴──────┐
-   │ + No decode latency │    │         │ + Smallest  │
-   │ + Direct processing │    │         │ + Fastest   │
-   │ - Largest storage   │    │         │ - Inflexible│
-   │ - I/O bound         │    │         │ - Must pre- │
-   └─────────────────────┘    │         │   compute   │
-                              │         └─────────────┘
-              ┌───────────────┴───────────────┐
-              │ + Good compression (2-5x)     │
-              │ + Lossless (FLAC) or lossy   │
-              │ - Decode overhead            │
-              │ - More complex pipeline      │
-              └───────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         DIGITAL AUDIO FUNDAMENTALS                             │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  ANALOG (continuous)                     DIGITAL (discrete)                   │
+│                                                                                │
+│  Sound Wave:                             Samples:                              │
+│       │    /\                                 │  ●   ●                        │
+│       │   /  \    /\                          │ ● \ / ●  ●                    │
+│  ─────┼──/────\──/──\──────              ─────┼●───●───●──●──                │
+│       │ /      \/    \                        │      ●     ●                  │
+│       │/                                      │                                │
+│                                                                                │
+│  Each ● is a SAMPLE: a number representing amplitude at that moment.         │
+│                                                                                │
+│  KEY PARAMETERS:                                                               │
+│  ───────────────                                                               │
+│                                                                                │
+│  Sample Rate (Hz)      Samples per second           Typical values            │
+│  ─────────────────     ──────────────────           ─────────────             │
+│  8,000 Hz              8,000 samples/sec            Telephone                  │
+│  16,000 Hz             16,000 samples/sec           Speech recognition         │
+│  44,100 Hz             44,100 samples/sec           CD audio                   │
+│  48,000 Hz             48,000 samples/sec           Professional audio         │
+│                                                                                │
+│  Bit Depth             Precision of each sample     Storage per sample        │
+│  ─────────             ────────────────────────     ─────────────────         │
+│  8-bit                 256 levels                   1 byte                     │
+│  16-bit                65,536 levels                2 bytes (standard)         │
+│  24-bit                16.7 million levels          3 bytes (pro audio)        │
+│  32-bit float          Infinite (floating point)    4 bytes (processing)       │
+│                                                                                │
+│  Channels              Number of independent streams                           │
+│  ────────              ─────────────────────────────                          │
+│  Mono                  1 channel                                               │
+│  Stereo                2 channels (left + right)                               │
+│  Surround              5.1, 7.1 channels                                       │
+│                                                                                │
+│  STORAGE CALCULATION:                                                          │
+│  ────────────────────                                                          │
+│  Bytes = sample_rate × bit_depth/8 × channels × duration_seconds              │
+│                                                                                │
+│  Example: 10 seconds, 16kHz, 16-bit mono                                       │
+│  = 16000 × 2 × 1 × 10 = 320,000 bytes = 320 KB                                │
+│                                                                                │
+│  Example: 1 hour, 48kHz, 16-bit stereo                                        │
+│  = 48000 × 2 × 2 × 3600 = 691,200,000 bytes = 691 MB                          │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 1. Raw Waveform Field
+### Frequency Domain Representations
 
-### Design
+Many audio models work in the **frequency domain** rather than the time domain.
+
+```
+TIME DOMAIN (Waveform):
+    Amplitude
+       │  /\    /\    /\    /\
+    ───┼─/──\──/──\──/──\──/──\───▶ Time
+       │/    \/    \/    \/
+
+           FFT (Fast Fourier Transform)
+                    │
+                    ▼
+
+FREQUENCY DOMAIN (Spectrum):
+    Magnitude
+       │  ▄
+       │  █      ▄
+       │ ▄█▄   ▄▄█▄
+    ───┼█████▄▄█████▄────────────▶ Frequency
+       0    1kHz    5kHz   10kHz
+```
+
+**Common Representations:**
+
+| Name | Shape | Description | Use Case |
+|------|-------|-------------|----------|
+| Waveform | `(samples,)` | Raw audio | WaveNet, raw audio models |
+| Spectrogram | `(freq_bins, time_frames)` | Magnitude of STFT | Visualization, some models |
+| Mel Spectrogram | `(n_mels, time_frames)` | Log-scaled frequency | ASR, TTS, audio classification |
+| MFCC | `(n_mfcc, time_frames)` | Cepstral coefficients | Classic speech recognition |
+| Codec Tokens | `(n_codebooks, frames)` | Discrete tokens | Audio language models |
+
+## Storage Strategy Decision
+
+Choose your storage strategy based on your use case:
+
+```python
+def choose_audio_storage_strategy(
+    use_case: str,
+    avg_duration_seconds: float,
+    num_samples: int,
+    disk_budget_gb: float,
+    training_model: str,
+) -> str:
+    """
+    Decide which audio storage strategy to use.
+    
+    Returns one of: 'raw', 'compressed', 'spectrogram', 'codec_tokens'
+    """
+    raw_size_gb = (
+        16000 * 2  # 16kHz, 16-bit
+        * avg_duration_seconds 
+        * num_samples 
+        / 1e9
+    )
+    
+    # If model needs waveforms and storage allows
+    if training_model in ['wavenet', 'hifi-gan', 'voicebox'] and raw_size_gb < disk_budget_gb:
+        return 'raw'
+    
+    # If model uses spectrograms (most common for ASR/TTS)
+    if training_model in ['whisper', 'tacotron', 'vits', 'conformer']:
+        return 'spectrogram'  # ~5-10x smaller than raw
+    
+    # If model is audio language model
+    if training_model in ['audioflamingo', 'musiclm', 'audiolm']:
+        return 'codec_tokens'  # ~20x smaller than raw
+    
+    # If storage is tight, use compression
+    if raw_size_gb > disk_budget_gb:
+        if use_case == 'research':
+            return 'compressed_lossless'  # FLAC: ~2x compression
+        else:
+            return 'compressed_lossy'  # Opus: ~10x compression
+    
+    return 'raw'
+```
+
+## Field Implementation 1: Raw Waveform
+
+The simplest case: store the raw PCM samples.
+
 ```python
 import numpy as np
-from typing import Type
+from typing import Type, Tuple, Optional
+import struct
 
 class AudioWaveformField:
     """
-    Store raw audio waveforms (PCM).
+    Field for storing raw PCM audio waveforms.
     
-    Best for:
-    - Short audio clips (<10 sec)
-    - When decode latency matters
-    - When full waveform needed (e.g., WaveNet training)
+    The waveform is stored as a contiguous array of samples.
+    Metadata includes sample count, sample rate, and format.
     
-    Storage: 2 bytes/sample × sample_rate × duration × channels
-    Example: 5 sec @ 16kHz mono = 160 KB
+    Advantages:
+    - Zero decode latency
+    - Direct access for time-domain models
+    - No quality loss
+    
+    Disadvantages:
+    - Largest storage (2 bytes/sample at 16-bit)
+    - I/O bound for longer audio
     """
     
-    def __init__(self, 
-                 sample_rate: int = 16000,
-                 mono: bool = True,
-                 dtype: str = 'int16'):
+    TYPE_ID = 20  # Unique identifier for this field type
+    
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        mono: bool = True,
+        dtype: str = 'int16',
+        normalize: bool = False,
+    ):
+        """
+        Args:
+            sample_rate: Target sample rate. Audio will be resampled if needed.
+            mono: If True, convert stereo to mono.
+            dtype: Storage dtype ('int16' for compact, 'float32' for precision).
+            normalize: If True, normalize audio to [-1, 1] before storing.
+        """
         self.sample_rate = sample_rate
         self.mono = mono
         self.dtype = np.dtype(dtype)
+        self.normalize = normalize
     
     @property
     def metadata_type(self) -> np.dtype:
+        """
+        Define the per-sample metadata structure.
+        """
         return np.dtype([
-            ('data_ptr', '<u8'),       # Pointer to waveform data
+            ('data_ptr', '<u8'),       # Byte offset to waveform data
             ('num_samples', '<u4'),    # Number of audio samples
+            ('duration_ms', '<u4'),    # Duration in milliseconds (for quick filtering)
             ('sample_rate', '<u4'),    # Sample rate (Hz)
             ('channels', '<u1'),       # Number of channels
-            ('dtype_code', '<u1'),     # 0=int16, 1=float32
+            ('dtype_code', '<u1'),     # 0=int16, 1=float32, 2=int32
+            ('_pad', '<u2'),           # Padding for alignment
         ], align=True)
     
-    def encode(self, destination, audio, malloc):
+    def encode(self, audio: np.ndarray, sample_rate: int = None) -> Tuple[np.ndarray, bytes]:
         """
-        audio: numpy array, shape (num_samples,) or (num_samples, channels)
+        Encode an audio waveform.
+        
+        Args:
+            audio: Audio array, shape (samples,) or (samples, channels)
+            sample_rate: Original sample rate (if resampling needed)
+        
+        Returns:
+            (metadata, data_bytes)
         """
-        # Normalize shape
+        # Handle sample rate
+        if sample_rate is not None and sample_rate != self.sample_rate:
+            audio = self._resample(audio, sample_rate, self.sample_rate)
+        
+        # Ensure 2D: (samples, channels)
         if audio.ndim == 1:
             audio = audio.reshape(-1, 1)
         
-        # Resample if needed
-        if hasattr(audio, 'sample_rate') and audio.sample_rate != self.sample_rate:
-            audio = self._resample(audio, self.sample_rate)
-        
         # Convert to mono if needed
         if self.mono and audio.shape[1] > 1:
-            audio = audio.mean(axis=1, keepdims=True)
+            audio = audio.mean(axis=1, keepdims=True).astype(audio.dtype)
         
-        # Convert dtype
-        audio = audio.astype(self.dtype)
+        # Normalize if requested
+        if self.normalize:
+            max_val = np.abs(audio).max()
+            if max_val > 0:
+                audio = audio / max_val
         
-        # Allocate and write
+        # Convert to storage dtype
+        if self.dtype == np.int16:
+            if audio.dtype == np.float32 or audio.dtype == np.float64:
+                audio = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+            else:
+                audio = audio.astype(np.int16)
+        else:
+            audio = audio.astype(self.dtype)
+        
+        # Create metadata
         num_samples, channels = audio.shape
-        byte_size = audio.nbytes
+        duration_ms = int(num_samples / self.sample_rate * 1000)
         
-        ptr, buffer = malloc(byte_size)
-        buffer[:] = audio.tobytes()
+        metadata = np.zeros(1, dtype=self.metadata_type)[0]
+        metadata['data_ptr'] = 0  # Will be filled by writer
+        metadata['num_samples'] = num_samples
+        metadata['duration_ms'] = duration_ms
+        metadata['sample_rate'] = self.sample_rate
+        metadata['channels'] = channels
+        metadata['dtype_code'] = {np.int16: 0, np.float32: 1, np.int32: 2}.get(self.dtype.type, 0)
         
-        # Store metadata
-        destination['data_ptr'] = ptr
-        destination['num_samples'] = num_samples
-        destination['sample_rate'] = self.sample_rate
-        destination['channels'] = channels
-        destination['dtype_code'] = {'int16': 0, 'float32': 1}[self.dtype.name]
+        # Convert to bytes
+        data_bytes = audio.tobytes()
+        
+        return metadata, data_bytes
+    
+    def _resample(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate."""
+        import scipy.signal
+        
+        if orig_sr == target_sr:
+            return audio
+        
+        # Calculate new length
+        duration = len(audio) / orig_sr
+        new_length = int(duration * target_sr)
+        
+        # Resample
+        resampled = scipy.signal.resample(audio, new_length)
+        
+        return resampled.astype(audio.dtype)
+    
+    def to_binary(self) -> bytes:
+        """Serialize field configuration."""
+        return struct.pack('<IIBB',
+            self.sample_rate,
+            1 if self.mono else 0,
+            {np.int16: 0, np.float32: 1, np.int32: 2}.get(self.dtype.type, 0),
+            1 if self.normalize else 0,
+        )
+    
+    @classmethod
+    def from_binary(cls, data: bytes) -> 'AudioWaveformField':
+        """Deserialize field configuration."""
+        sr, mono, dtype_code, normalize = struct.unpack('<IIBB', data[:10])
+        dtype = {0: 'int16', 1: 'float32', 2: 'int32'}[dtype_code]
+        return cls(sample_rate=sr, mono=bool(mono), dtype=dtype, normalize=bool(normalize))
     
     def get_decoder_class(self) -> Type:
         return AudioWaveformDecoder
-```
 
-### Decoder
-```python
+
 class AudioWaveformDecoder:
-    """Decode raw waveform from storage."""
+    """Decoder for raw audio waveforms."""
+    
+    def __init__(self, field: AudioWaveformField, metadata: np.ndarray, memory_read):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
+        
+        # Find max dimensions for buffer allocation
+        self.max_samples = int(metadata['num_samples'].max())
+        self.max_channels = int(metadata['channels'].max())
+        self.dtype = {0: np.int16, 1: np.float32, 2: np.int32}[
+            int(metadata['dtype_code'][0])
+        ]
     
     def declare_state_and_memory(self, previous_state):
-        # Max length in dataset
-        max_samples = int(self.metadata['num_samples'].max())
-        max_channels = int(self.metadata['channels'].max())
+        from dataclasses import dataclass
         
-        dtype = np.int16 if self.metadata['dtype_code'][0] == 0 else np.float32
+        @dataclass
+        class State:
+            shape: tuple
+            dtype: np.dtype
+            jit_mode: bool
+            sample_rate: int
         
-        return (
-            State(shape=(max_samples, max_channels), dtype=dtype, jit_mode=True),
-            AllocationQuery((max_samples, max_channels), dtype=dtype)
+        @dataclass
+        class AllocationQuery:
+            shape: tuple
+            dtype: np.dtype
+        
+        new_state = State(
+            shape=(self.max_samples, self.max_channels),
+            dtype=self.dtype,
+            jit_mode=True,
+            sample_rate=self.field.sample_rate,
         )
+        allocation = AllocationQuery(
+            shape=(self.max_samples, self.max_channels),
+            dtype=self.dtype,
+        )
+        return new_state, allocation
     
     def generate_code(self):
+        metadata = self.metadata
         mem_read = self.memory_read
+        dtype = self.dtype
+        bytes_per_sample = np.dtype(dtype).itemsize
         
-        def decode(indices, destination, metadata, storage_state):
-            for ix in range(len(indices)):
-                sample_id = indices[ix]
+        def decode(batch_indices, destination, metadata_arg, storage_state):
+            """
+            Decode a batch of audio waveforms.
+            
+            Args:
+                batch_indices: Array of sample IDs to decode.
+                destination: Pre-allocated output buffer (batch, max_samples, max_channels).
+                metadata_arg: The metadata table (unused, we use closure).
+                storage_state: Tuple for memory access.
+            
+            Returns:
+                destination (populated with decoded audio)
+            """
+            for ix in range(len(batch_indices)):
+                sample_id = batch_indices[ix]
+                
+                # Get metadata
                 ptr = metadata[sample_id]['data_ptr']
                 num_samples = metadata[sample_id]['num_samples']
                 channels = metadata[sample_id]['channels']
                 
-                raw = mem_read(ptr, storage_state)
-                audio = raw.view(np.int16).reshape(num_samples, channels)
+                # Calculate byte size
+                byte_size = num_samples * channels * bytes_per_sample
+                
+                # Read raw bytes
+                raw_bytes = mem_read(ptr, storage_state)[:byte_size]
+                
+                # View as audio array
+                audio = raw_bytes.view(dtype).reshape(num_samples, channels)
+                
+                # Copy to destination
                 destination[ix, :num_samples, :channels] = audio
+                
+                # Zero-pad the rest
+                destination[ix, num_samples:, :] = 0
+                destination[ix, :, channels:] = 0
             
-            return destination[:len(indices)]
+            return destination[:len(batch_indices)]
         
         decode.is_parallel = True
         return decode
 ```
 
-## 2. Compressed Audio Field
+## Field Implementation 2: Pre-computed Mel Spectrogram
 
-### Design with FLAC/Opus
-```python
-import subprocess
-import io
+For models that use spectrograms, pre-compute them to eliminate FFT overhead during training.
 
-class CompressedAudioField:
-    """
-    Store audio with lossless (FLAC) or lossy (Opus) compression.
-    
-    Best for:
-    - Large datasets
-    - When storage/bandwidth is limited
-    - Longer audio clips
-    
-    Compression ratios:
-    - FLAC: ~50-60% of original
-    - Opus: ~5-10% of original (lossy)
-    """
-    
-    CODECS = {
-        'flac': {'ext': 'flac', 'lossless': True},
-        'opus': {'ext': 'opus', 'lossless': False},
-        'mp3': {'ext': 'mp3', 'lossless': False},
-    }
-    
-    def __init__(self, 
-                 codec: str = 'flac',
-                 sample_rate: int = 16000,
-                 bitrate: int = 64000):  # For lossy codecs
-        self.codec = codec
-        self.sample_rate = sample_rate
-        self.bitrate = bitrate
-    
-    @property
-    def metadata_type(self) -> np.dtype:
-        return np.dtype([
-            ('data_ptr', '<u8'),
-            ('data_size', '<u4'),      # Compressed size
-            ('num_samples', '<u4'),    # Original sample count
-            ('sample_rate', '<u4'),
-            ('channels', '<u1'),
-            ('codec', '<u1'),          # Codec ID
-        ], align=True)
-    
-    def encode(self, destination, audio, malloc):
-        import soundfile as sf
-        
-        # Compress to buffer
-        buffer = io.BytesIO()
-        sf.write(buffer, audio, self.sample_rate, format=self.codec.upper())
-        compressed = buffer.getvalue()
-        
-        # Write to storage
-        ptr, storage_buffer = malloc(len(compressed))
-        storage_buffer[:] = np.frombuffer(compressed, dtype='u1')
-        
-        # Metadata
-        destination['data_ptr'] = ptr
-        destination['data_size'] = len(compressed)
-        destination['num_samples'] = len(audio)
-        destination['sample_rate'] = self.sample_rate
-        destination['channels'] = 1 if audio.ndim == 1 else audio.shape[1]
-        destination['codec'] = list(self.CODECS.keys()).index(self.codec)
-
-
-class CompressedAudioDecoder:
-    """Decode compressed audio on-the-fly."""
-    
-    def generate_code(self):
-        import soundfile as sf
-        mem_read = self.memory_read
-        
-        def decode(indices, destination, metadata, storage_state):
-            for ix, sample_id in enumerate(indices):
-                ptr = metadata[sample_id]['data_ptr']
-                size = metadata[sample_id]['data_size']
-                
-                # Read compressed bytes
-                compressed = mem_read(ptr, storage_state)[:size]
-                
-                # Decode (this is the overhead!)
-                buffer = io.BytesIO(compressed.tobytes())
-                audio, sr = sf.read(buffer)
-                
-                destination[ix, :len(audio)] = audio
-            
-            return destination[:len(indices)]
-        
-        return decode
-```
-
-## 3. Spectrogram Field
-
-### Pre-computed Mel Spectrograms
 ```python
 class MelSpectrogramField:
     """
-    Store pre-computed mel spectrograms.
+    Field for storing pre-computed mel spectrograms.
     
-    Best for:
-    - Models that use spectrograms (most ASR, TTS)
-    - When spectrogram params are fixed
-    - Fastest loading (no FFT during training)
+    The spectrogram is computed once during dataset creation and stored.
+    This is the most common approach for ASR and TTS training.
     
-    Storage: n_mels × time_frames × 4 bytes (float32)
-    Example: 80 mels × 100 frames = 32 KB
+    Advantages:
+    - No FFT during training (significant speedup)
+    - Compact storage (especially with float16)
+    - Consistent parameters across training
+    
+    Disadvantages:
+    - Inflexible (can't change n_mels, hop_length, etc.)
+    - Must recompute dataset to change parameters
     """
     
-    def __init__(self,
-                 n_mels: int = 80,
-                 n_fft: int = 1024,
-                 hop_length: int = 256,
-                 sample_rate: int = 16000,
-                 store_dtype: str = 'float16'):  # Save space
-        self.n_mels = n_mels
+    TYPE_ID = 21
+    
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        n_mels: int = 80,
+        f_min: float = 0.0,
+        f_max: float = 8000.0,
+        power: float = 2.0,
+        log_scale: bool = True,
+        store_dtype: str = 'float16',
+    ):
+        self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
-        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.f_min = f_min
+        self.f_max = f_max
+        self.power = power
+        self.log_scale = log_scale
         self.store_dtype = np.dtype(store_dtype)
+        
+        # Pre-compute mel filterbank
+        self._mel_filters = self._create_mel_filterbank()
+    
+    def _create_mel_filterbank(self) -> np.ndarray:
+        """Create the mel filterbank matrix."""
+        import numpy as np
+        
+        # Mel scale conversion
+        def hz_to_mel(hz):
+            return 2595.0 * np.log10(1.0 + hz / 700.0)
+        
+        def mel_to_hz(mel):
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+        
+        n_freqs = self.n_fft // 2 + 1
+        
+        # Mel points
+        mel_min = hz_to_mel(self.f_min)
+        mel_max = hz_to_mel(self.f_max)
+        mel_points = np.linspace(mel_min, mel_max, self.n_mels + 2)
+        hz_points = mel_to_hz(mel_points)
+        
+        # Convert to FFT bins
+        bin_points = np.floor((self.n_fft + 1) * hz_points / self.sample_rate).astype(int)
+        
+        # Create triangular filters
+        filters = np.zeros((self.n_mels, n_freqs), dtype=np.float32)
+        for m in range(self.n_mels):
+            left = bin_points[m]
+            center = bin_points[m + 1]
+            right = bin_points[m + 2]
+            
+            # Rising edge
+            for k in range(left, center):
+                if center > left:
+                    filters[m, k] = (k - left) / (center - left)
+            
+            # Falling edge
+            for k in range(center, right):
+                if right > center:
+                    filters[m, k] = (right - k) / (right - center)
+        
+        return filters
     
     @property
     def metadata_type(self) -> np.dtype:
         return np.dtype([
             ('data_ptr', '<u8'),
-            ('time_frames', '<u4'),    # Number of time frames
-            ('n_mels', '<u2'),         # Number of mel bins
+            ('time_frames', '<u4'),
+            ('n_mels', '<u2'),
+            ('dtype_code', '<u1'),  # 0=float16, 1=float32
+            ('_pad', '<u1'),
         ], align=True)
     
-    def encode(self, destination, audio, malloc):
-        import librosa
+    def encode(self, audio: np.ndarray, sample_rate: int = None) -> Tuple[np.ndarray, bytes]:
+        """
+        Compute and encode mel spectrogram.
         
-        # Compute mel spectrogram
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio.astype(np.float32),
-            sr=self.sample_rate,
-            n_mels=self.n_mels,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length
+        Args:
+            audio: Audio waveform (1D array)
+            sample_rate: Original sample rate
+        
+        Returns:
+            (metadata, data_bytes)
+        """
+        import scipy.signal
+        
+        # Resample if needed
+        if sample_rate is not None and sample_rate != self.sample_rate:
+            duration = len(audio) / sample_rate
+            new_length = int(duration * self.sample_rate)
+            audio = scipy.signal.resample(audio, new_length)
+        
+        # Ensure float
+        audio = audio.astype(np.float32)
+        
+        # Compute STFT
+        _, _, stft = scipy.signal.stft(
+            audio,
+            fs=self.sample_rate,
+            nperseg=self.n_fft,
+            noverlap=self.n_fft - self.hop_length,
+            nfft=self.n_fft,
         )
         
-        # Convert to log scale and store dtype
-        mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+        # Compute power spectrum
+        power_spec = np.abs(stft) ** self.power
+        
+        # Apply mel filterbank
+        mel_spec = np.dot(self._mel_filters, power_spec)
+        
+        # Log scale
+        if self.log_scale:
+            mel_spec = np.log(mel_spec + 1e-10)
+        
+        # Convert to storage dtype
         mel_spec = mel_spec.astype(self.store_dtype)
         
-        # Shape: (n_mels, time_frames)
+        # Create metadata
         n_mels, time_frames = mel_spec.shape
         
-        # Store
-        ptr, buffer = malloc(mel_spec.nbytes)
-        buffer[:] = mel_spec.tobytes()
+        metadata = np.zeros(1, dtype=self.metadata_type)[0]
+        metadata['data_ptr'] = 0
+        metadata['time_frames'] = time_frames
+        metadata['n_mels'] = n_mels
+        metadata['dtype_code'] = 0 if self.store_dtype == np.float16 else 1
         
-        destination['data_ptr'] = ptr
-        destination['time_frames'] = time_frames
-        destination['n_mels'] = n_mels
+        return metadata, mel_spec.tobytes()
+    
+    def to_binary(self) -> bytes:
+        return struct.pack('<IIIHHffBB',
+            self.sample_rate,
+            self.n_fft,
+            self.hop_length,
+            self.n_mels,
+            0,  # reserved
+            self.f_min,
+            self.f_max,
+            1 if self.log_scale else 0,
+            0 if self.store_dtype == np.float16 else 1,
+        )
+    
+    @classmethod
+    def from_binary(cls, data: bytes) -> 'MelSpectrogramField':
+        sr, n_fft, hop, n_mels, _, f_min, f_max, log_scale, dtype_code = struct.unpack(
+            '<IIIHHffBB', data[:24]
+        )
+        return cls(
+            sample_rate=sr,
+            n_fft=n_fft,
+            hop_length=hop,
+            n_mels=n_mels,
+            f_min=f_min,
+            f_max=f_max,
+            log_scale=bool(log_scale),
+            store_dtype='float16' if dtype_code == 0 else 'float32',
+        )
+    
+    def get_decoder_class(self) -> Type:
+        return MelSpectrogramDecoder
 
 
 class MelSpectrogramDecoder:
-    """Decode pre-computed mel spectrogram."""
+    """Decoder for pre-computed mel spectrograms."""
+    
+    def __init__(self, field: MelSpectrogramField, metadata: np.ndarray, memory_read):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
+        
+        self.max_time = int(metadata['time_frames'].max())
+        self.n_mels = int(metadata['n_mels'].max())
+        self.dtype = np.float16 if metadata['dtype_code'][0] == 0 else np.float32
     
     def declare_state_and_memory(self, previous_state):
-        max_time = int(self.metadata['time_frames'].max())
-        n_mels = int(self.metadata['n_mels'].max())
-        
-        return (
-            State(shape=(n_mels, max_time), dtype=np.float16, jit_mode=True),
-            AllocationQuery((n_mels, max_time), dtype=np.float16)
-        )
+        # ... similar to AudioWaveformDecoder
+        pass
     
     def generate_code(self):
+        metadata = self.metadata
         mem_read = self.memory_read
+        dtype = self.dtype
         
-        def decode(indices, destination, metadata, storage_state):
-            for ix, sample_id in enumerate(indices):
+        def decode(batch_indices, destination, metadata_arg, storage_state):
+            for ix in range(len(batch_indices)):
+                sample_id = batch_indices[ix]
+                
                 ptr = metadata[sample_id]['data_ptr']
                 time_frames = metadata[sample_id]['time_frames']
                 n_mels = metadata[sample_id]['n_mels']
                 
-                raw = mem_read(ptr, storage_state)
-                spec = raw.view(np.float16).reshape(n_mels, time_frames)
+                byte_size = time_frames * n_mels * np.dtype(dtype).itemsize
+                raw = mem_read(ptr, storage_state)[:byte_size]
+                
+                spec = raw.view(dtype).reshape(n_mels, time_frames)
                 destination[ix, :n_mels, :time_frames] = spec
+                
+                # Zero-pad
+                destination[ix, :, time_frames:] = 0
             
-            return destination[:len(indices)]
+            return destination[:len(batch_indices)]
         
         decode.is_parallel = True
         return decode
 ```
 
-## 4. Neural Codec Field (EnCodec/SoundStream Tokens)
+## Field Implementation 3: Neural Codec Tokens
 
-### Storing Discrete Audio Tokens
+For audio language models (AudioLM, MusicLM, etc.), store discrete tokens from neural codecs.
+
 ```python
 class AudioCodecTokenField:
     """
-    Store discrete tokens from neural audio codecs.
+    Field for storing discrete audio tokens from neural codecs like EnCodec.
     
-    Best for:
-    - Audio language models (AudioLM, MusicLM)
-    - Extremely compact storage
-    - When using codec-based models
+    Neural codecs (EnCodec, SoundStream, DAC) encode audio into sequences
+    of discrete tokens from learned codebooks. This is similar to how
+    BPE tokenizes text.
     
-    Storage: n_codebooks × time_frames × 2 bytes (uint16)
-    Example: 8 codebooks × 75 frames/sec × 10 sec = 12 KB
+    Advantages:
+    - Extremely compact (~10x smaller than waveform)
+    - Native format for audio language models
+    - Self-contained (no external decoder needed at inference)
+    
+    Disadvantages:
+    - Lossy (codec determines quality)
+    - Requires codec model for reconstruction
     """
     
-    def __init__(self,
-                 n_codebooks: int = 8,
-                 codec_sr: int = 75,  # EnCodec: 75 Hz at 24kHz
-                 vocab_size: int = 1024):
+    TYPE_ID = 22
+    
+    def __init__(
+        self,
+        n_codebooks: int = 8,
+        vocab_size: int = 1024,
+        frame_rate: int = 75,  # EnCodec @ 24kHz uses 75 Hz
+    ):
         self.n_codebooks = n_codebooks
-        self.codec_sr = codec_sr
         self.vocab_size = vocab_size
+        self.frame_rate = frame_rate
     
     @property
     def metadata_type(self) -> np.dtype:
         return np.dtype([
             ('data_ptr', '<u8'),
-            ('num_frames', '<u4'),     # Number of codec frames
-            ('n_codebooks', '<u1'),    # Number of codebooks used
+            ('num_frames', '<u4'),
+            ('n_codebooks', '<u1'),
+            ('_pad', '<u1', 3),
         ], align=True)
     
-    def encode(self, destination, tokens, malloc):
+    def encode(self, tokens: np.ndarray) -> Tuple[np.ndarray, bytes]:
         """
-        tokens: numpy array of shape (n_codebooks, num_frames)
-                or pre-encoded from EnCodec/SoundStream
+        Store pre-computed codec tokens.
+        
+        Args:
+            tokens: Array of shape (n_codebooks, num_frames), dtype uint16
+        
+        Returns:
+            (metadata, data_bytes)
         """
-        # Validate
+        assert tokens.ndim == 2
         assert tokens.max() < self.vocab_size
-        tokens = tokens.astype('<u2')  # uint16
         
         n_codebooks, num_frames = tokens.shape
+        tokens = tokens.astype('<u2')  # uint16 little-endian
         
-        # Store
-        ptr, buffer = malloc(tokens.nbytes)
-        buffer[:] = tokens.tobytes()
+        metadata = np.zeros(1, dtype=self.metadata_type)[0]
+        metadata['data_ptr'] = 0
+        metadata['num_frames'] = num_frames
+        metadata['n_codebooks'] = n_codebooks
         
-        destination['data_ptr'] = ptr
-        destination['num_frames'] = num_frames
-        destination['n_codebooks'] = n_codebooks
+        return metadata, tokens.tobytes()
     
-    @staticmethod
-    def from_waveform(audio, sample_rate, codec_model):
+    @classmethod
+    def encode_from_audio(cls, audio: np.ndarray, sample_rate: int, codec) -> np.ndarray:
         """
-        Helper to encode waveform to codec tokens.
+        Encode audio to codec tokens using a pre-loaded codec model.
         
-        codec_model: Pre-loaded EnCodec or SoundStream model
+        Args:
+            audio: Audio waveform
+            sample_rate: Sample rate of audio
+            codec: Loaded EnCodec/SoundStream model
+        
+        Returns:
+            tokens: Array of shape (n_codebooks, num_frames)
         """
         import torch
         
-        # Ensure correct sample rate (EnCodec uses 24kHz)
+        # Prepare audio tensor
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio).float()
+        
+        # Ensure correct shape: (batch, channels, samples)
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0).unsqueeze(0)
+        elif audio.dim() == 2:
+            audio = audio.unsqueeze(0)
+        
+        # Resample if needed (EnCodec expects 24kHz)
         if sample_rate != 24000:
-            import torchaudio.transforms as T
-            resampler = T.Resample(sample_rate, 24000)
-            audio = resampler(torch.from_numpy(audio))
-        else:
-            audio = torch.from_numpy(audio)
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(sample_rate, 24000)
+            audio = resampler(audio)
         
         # Encode
         with torch.no_grad():
-            codes = codec_model.encode(audio.unsqueeze(0).unsqueeze(0))
+            encoded = codec.encode(audio)
+            # EnCodec returns list of (codes, scales) tuples
+            if isinstance(encoded, list):
+                codes = encoded[0][0]  # First codebook
+            else:
+                codes = encoded
         
         return codes.squeeze().cpu().numpy()
-```
+    
+    def to_binary(self) -> bytes:
+        return struct.pack('<HHI', self.n_codebooks, self.vocab_size, self.frame_rate)
+    
+    @classmethod
+    def from_binary(cls, data: bytes) -> 'AudioCodecTokenField':
+        n_cb, vocab, fr = struct.unpack('<HHI', data[:8])
+        return cls(n_codebooks=n_cb, vocab_size=vocab, frame_rate=fr)
+    
+    def get_decoder_class(self) -> Type:
+        return AudioCodecTokenDecoder
 
-## 5. Hybrid Field: Waveform + Spectrogram
 
-```python
-class HybridAudioField:
-    """
-    Store both waveform AND pre-computed features.
+class AudioCodecTokenDecoder:
+    """Decoder for audio codec tokens."""
     
-    Best for:
-    - Research/experimentation
-    - When you need both representations
-    - Flexibility over storage efficiency
-    """
-    
-    def __init__(self,
-                 waveform_config: dict,
-                 spectrogram_config: dict):
-        self.waveform_field = AudioWaveformField(**waveform_config)
-        self.spectrogram_field = MelSpectrogramField(**spectrogram_config)
-    
-    @property
-    def metadata_type(self) -> np.dtype:
-        return np.dtype([
-            ('waveform', self.waveform_field.metadata_type),
-            ('spectrogram', self.spectrogram_field.metadata_type),
-        ], align=True)
-    
-    def encode(self, destination, audio, malloc):
-        # Store waveform
-        self.waveform_field.encode(
-            destination['waveform'], 
-            audio, 
-            malloc
-        )
+    def __init__(self, field, metadata, memory_read):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
         
-        # Store spectrogram
-        self.spectrogram_field.encode(
-            destination['spectrogram'],
-            audio,
-            malloc
-        )
+        self.max_frames = int(metadata['num_frames'].max())
+        self.n_codebooks = int(metadata['n_codebooks'].max())
+    
+    def generate_code(self):
+        metadata = self.metadata
+        mem_read = self.memory_read
+        
+        def decode(batch_indices, destination, metadata_arg, storage_state):
+            for ix in range(len(batch_indices)):
+                sample_id = batch_indices[ix]
+                
+                ptr = metadata[sample_id]['data_ptr']
+                num_frames = metadata[sample_id]['num_frames']
+                n_codebooks = metadata[sample_id]['n_codebooks']
+                
+                byte_size = num_frames * n_codebooks * 2  # uint16
+                raw = mem_read(ptr, storage_state)[:byte_size]
+                
+                tokens = raw.view('<u2').reshape(n_codebooks, num_frames)
+                destination[ix, :n_codebooks, :num_frames] = tokens
+            
+            return destination[:len(batch_indices)]
+        
+        decode.is_parallel = True
+        return decode
 ```
 
 ## Performance Comparison
 
-| Field Type | Storage/min | Decode Time | Best Use Case |
-|------------|-------------|-------------|---------------|
-| Raw PCM (16kHz, 16-bit) | 1.9 MB | 0 ms | Short clips, low latency |
-| FLAC | 0.9 MB | 5-10 ms | Large datasets, lossless |
-| Opus (64kbps) | 0.5 MB | 2-5 ms | Very large datasets |
-| Mel Spectrogram | 0.3 MB | 0 ms | ASR/TTS training |
-| Codec Tokens | 0.09 MB | 0 ms | Audio LMs |
-
-## Complete Example: Audio Dataset Writer
-
-```python
-from dataclasses import dataclass
-from typing import Dict
-import numpy as np
-
-@dataclass
-class AudioDataset:
-    """Example audio dataset."""
-    audio_paths: list
-    labels: list
-    
-    def __len__(self):
-        return len(self.audio_paths)
-    
-    def __getitem__(self, idx):
-        import soundfile as sf
-        audio, sr = sf.read(self.audio_paths[idx])
-        return (audio, self.labels[idx])
-
-
-def write_audio_dataset(
-    dataset,
-    output_path: str,
-    field_type: str = 'spectrogram',
-    **field_kwargs
-):
-    """Write an audio dataset to custom format."""
-    
-    # Choose field type
-    if field_type == 'waveform':
-        audio_field = AudioWaveformField(**field_kwargs)
-    elif field_type == 'spectrogram':
-        audio_field = MelSpectrogramField(**field_kwargs)
-    elif field_type == 'compressed':
-        audio_field = CompressedAudioField(**field_kwargs)
-    elif field_type == 'codec':
-        audio_field = AudioCodecTokenField(**field_kwargs)
-    
-    # Create writer
-    from your_format import DatasetWriter, IntField
-    
-    writer = DatasetWriter(output_path, {
-        'audio': audio_field,
-        'label': IntField(),
-    })
-    
-    writer.from_indexed_dataset(dataset)
-    
-    return output_path
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      AUDIO FIELD PERFORMANCE COMPARISON                        │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  For 10 seconds of audio at 16kHz:                                            │
+│                                                                                │
+│  Field Type          Storage Size     Decode Time    Best Use Case            │
+│  ──────────          ────────────     ───────────    ─────────────            │
+│  Raw Waveform        320 KB           0 ms           WaveNet, HiFi-GAN        │
+│  (16-bit mono)                        (memcpy)       Real-time synthesis      │
+│                                                                                │
+│  FLAC Compressed     160 KB           5-10 ms        Large archives           │
+│  (~50% of raw)                        (decompress)   Bandwidth limited        │
+│                                                                                │
+│  Opus Compressed     50 KB            2-5 ms         Very large datasets      │
+│  (~15% of raw)                        (decompress)   Acceptable loss          │
+│                                                                                │
+│  Mel Spectrogram     64 KB            0 ms           ASR (Whisper)            │
+│  (80 mels, float16)                   (memcpy)       TTS (VITS, Tacotron)     │
+│                                                                                │
+│  Codec Tokens        12 KB            0 ms           AudioLM, MusicLM         │
+│  (8 codebooks)                        (memcpy)       VALL-E, Voicebox         │
+│                                                                                │
+│                                                                                │
+│  THROUGHPUT (samples/sec on NVMe SSD, single thread):                         │
+│                                                                                │
+│  Raw Waveform:       50,000+   (I/O bound)                                    │
+│  FLAC Compressed:    5,000     (CPU bound on decompress)                      │
+│  Mel Spectrogram:    100,000+  (I/O bound, small files)                       │
+│  Codec Tokens:       200,000+  (I/O bound, tiny files)                        │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Exercises
 
-1. Implement a `ChunkedAudioField` that stores long audio files in fixed-size chunks for better memory access patterns.
+1.  **Implement Compressed Audio Field**: Use `soundfile` to store FLAC-compressed audio. Benchmark decode time vs. raw.
 
-2. Create a benchmark comparing decode times for different audio field types on your hardware.
+2.  **Chunked Audio**: For very long audio (podcasts, audiobooks), implement a field that stores audio in fixed-length chunks (e.g., 30 seconds each).
 
-3. Design a `MultiTrackAudioField` for storing audio with separate stems (vocals, drums, bass, etc.).
+3.  **Multi-Track Field**: Design a field for storing stems (vocals, drums, bass, etc.) separately for music production datasets.
+
+4.  **Streaming Decode**: Implement a decoder that can decode a subset of the audio (e.g., a 2-second window) without loading the entire clip.

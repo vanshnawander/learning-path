@@ -1,217 +1,392 @@
 # Multimodal Data Design: Combining Modalities
 
-## The Multimodal Challenge
+## The Multimodal Landscape
 
-Real-world AI applications often combine multiple modalities:
+Modern AI systems often need to understand multiple types of data simultaneously. This presents unique challenges for data format design.
+
+### Common Multimodal Combinations
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    MULTIMODAL APPLICATIONS                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Application              Modalities                                     │
-│  ───────────              ──────────                                     │
-│                                                                          │
-│  Image Captioning         Image + Text                                   │
-│  Visual QA                Image + Text (Q) + Text (A)                   │
-│  Video Understanding      Video + Audio + Text (subtitles)              │
-│  Speech Recognition       Audio + Text (transcript)                     │
-│  Document AI              Image (scan) + Text (OCR) + Layout            │
-│  Robotics                 Image + Depth + Proprioception + Text         │
-│  Music Generation         Audio + MIDI + Text (lyrics)                  │
-│                                                                          │
-│  Key Challenges:                                                         │
-│  ───────────────                                                         │
-│                                                                          │
-│  1. SYNCHRONIZATION: Video frames must align with audio samples         │
-│  2. VARIABLE SIZES: Each modality has different size characteristics   │
-│  3. MIXED TYPES: Combine fixed (labels) with variable (images, text)   │
-│  4. ALIGNMENT: Maintain correspondence across modalities                │
-│  5. EFFICIENCY: Don't let one modality bottleneck the pipeline         │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      MULTIMODAL APPLICATIONS                                   │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  Application           Modalities           Sample Size       Challenges      │
+│  ───────────           ──────────           ───────────       ──────────      │
+│                                                                                │
+│  CLIP/BLIP             Image + Text         ~100 KB           Alignment       │
+│  (Vision-Language)     [JPEG] + [tokens]                      (caption to     │
+│                                                               image region)   │
+│                                                                                │
+│  Whisper               Audio + Text         ~50 KB            Synchronization │
+│  (Speech-to-Text)      [waveform] + [transcript]              (word timing)   │
+│                                                                                │
+│  Video Understanding   Video + Audio        ~5 MB             Frame-to-audio  │
+│                        + Text               + subtitles       alignment       │
+│                                                                                │
+│  Document AI           Image + Text         ~500 KB           Spatial layout  │
+│  (LayoutLM)            + Layout             + bounding boxes  (text position) │
+│                                                                                │
+│  Robotics              Images + Depth       ~10 MB            Temporal sync   │
+│                        + Proprioception     + sensor data     (sensor fusion) │
+│                        + Actions                                              │
+│                                                                                │
+│  Music Generation      Audio + MIDI         ~1 MB             Beat alignment  │
+│                        + Text (lyrics)                        (audio to notes)│
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Multimodal Sample Architecture
+### Key Challenges
 
-### Strategy 1: Unified Sample Record
+1.  **Size Heterogeneity**: A video frame is ~200KB, its caption is ~100 bytes.
+2.  **Temporal Alignment**: Audio samples don't align 1:1 with video frames.
+3.  **Missing Modalities**: Not all samples have all modalities.
+4.  **Independent Processing**: Each modality needs different transforms.
+5.  **Efficiency**: Loading one small modality shouldn't require reading the entire sample.
 
-All modalities stored together per sample:
+## Architecture 1: Unified Sample Record
+
+Store all modalities together per sample.
 
 ```python
 import numpy as np
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional, List
+import struct
 
-class MultimodalSampleFormat:
+class UnifiedMultimodalFormat:
     """
-    Store all modalities for a sample in one contiguous block.
+    Store all modalities for a sample in one contiguous record.
     
-    Layout:
-    ┌─────────────────────────────────────────────┐
-    │ Sample Header                               │
-    │ ├─ sample_id: uint32                       │
-    │ ├─ num_modalities: uint8                   │
-    │ ├─ modality_offsets: uint32[]              │
-    │ └─ modality_sizes: uint32[]                │
-    ├─────────────────────────────────────────────┤
-    │ Modality 0 Data (e.g., Image)              │
-    ├─────────────────────────────────────────────┤
-    │ Modality 1 Data (e.g., Text)               │
-    ├─────────────────────────────────────────────┤
-    │ Modality 2 Data (e.g., Audio)              │
-    └─────────────────────────────────────────────┘
+    File Layout:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │ File Header                                                             │
+    │ ├─ magic: bytes[4] = "MULT"                                            │
+    │ ├─ version: uint16                                                      │
+    │ ├─ num_samples: uint32                                                 │
+    │ ├─ num_modalities: uint8                                               │
+    │ └─ modality_descriptors: ModDesc[num_modalities]                       │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Sample Index Table (num_samples entries)                                │
+    │ └─ Each: (sample_ptr: uint64, sample_size: uint32)                     │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Sample 0: [Image data][Text data][Audio data]                          │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Sample 1: [Image data][Text data][Audio data]                          │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ ...                                                                     │
+    └─────────────────────────────────────────────────────────────────────────┘
     
-    Pros:
-    - Single seek to load all modalities
-    - Good cache locality
-    - Simple random access
+    Sample Internal Layout:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │ Sample Header                                                           │
+    │ ├─ modality_mask: uint32 (bitmask for present modalities)              │
+    │ ├─ offsets: uint32[num_modalities] (offset to each modality's data)    │
+    │ └─ sizes: uint32[num_modalities] (size of each modality's data)        │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Modality 0 Metadata + Data                                              │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Modality 1 Metadata + Data                                              │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ ...                                                                     │
+    └─────────────────────────────────────────────────────────────────────────┘
     
-    Cons:
-    - Must load entire sample even if only need one modality
-    - Variable total size
+    Advantages:
+    ✓ Single seek to load all modalities
+    ✓ Good cache locality
+    ✓ Simple random access
+    ✓ Modality mask handles missing data
+    
+    Disadvantages:
+    ✗ Must read entire sample even if only need one modality
+    ✗ Variable total size complicates parallel writing
     """
+    
+    MAGIC = b'MULT'
+    VERSION = 1
     
     def __init__(self, modality_fields: Dict[str, 'Field']):
+        """
+        Args:
+            modality_fields: Dict mapping modality name to Field instance.
+                             E.g., {'image': RGBImageField(), 'text': TokenizedTextField()}
+        """
         self.fields = modality_fields
         self.modality_names = list(modality_fields.keys())
         self.num_modalities = len(modality_fields)
+        
+        # Assign bit positions for modality mask
+        self.modality_bits = {name: 1 << i for i, name in enumerate(self.modality_names)}
     
     @property
-    def sample_header_type(self) -> np.dtype:
+    def modality_descriptor_type(self) -> np.dtype:
+        """Descriptor for each modality in the header."""
         return np.dtype([
-            ('sample_id', '<u4'),
-            ('num_modalities', '<u1'),
-            ('total_size', '<u4'),
-            # Per-modality offsets and sizes stored after header
+            ('name_hash', '<u4'),     # Hash of modality name
+            ('type_id', '<u2'),       # Field type ID
+            ('metadata_size', '<u2'), # Size of per-sample metadata
         ], align=True)
     
-    def encode_sample(
-        self,
-        sample_data: Dict[str, Any]
-    ) -> Tuple[np.ndarray, bytes]:
-        """Encode all modalities for one sample."""
-        
-        encoded_modalities = []
-        modality_metadata = []
-        
-        # Encode each modality
-        for name in self.modality_names:
-            field = self.fields[name]
-            data = sample_data.get(name)
-            
-            if data is not None:
-                meta, raw_bytes = field.encode(data)
-                encoded_modalities.append(raw_bytes)
-                modality_metadata.append((meta, len(raw_bytes)))
-            else:
-                # Missing modality
-                encoded_modalities.append(b'')
-                modality_metadata.append((None, 0))
-        
-        # Build offset table
-        offsets = np.zeros(self.num_modalities, dtype='<u4')
-        sizes = np.zeros(self.num_modalities, dtype='<u4')
-        
-        current_offset = 0
-        for i, (_, size) in enumerate(modality_metadata):
-            offsets[i] = current_offset
-            sizes[i] = size
-            current_offset += size
-        
-        # Pack: offsets + sizes + modality data
-        header_extension = offsets.tobytes() + sizes.tobytes()
-        all_data = header_extension + b''.join(encoded_modalities)
-        
-        # Sample header
-        header = np.zeros(1, dtype=self.sample_header_type)[0]
-        header['num_modalities'] = self.num_modalities
-        header['total_size'] = len(all_data)
-        
-        return header, all_data
+    @property
+    def sample_index_type(self) -> np.dtype:
+        """Index entry for each sample."""
+        return np.dtype([
+            ('sample_ptr', '<u8'),
+            ('sample_size', '<u4'),
+            ('_pad', '<u4'),
+        ], align=True)
     
-    def decode_sample(
+    def _compute_sample_header_size(self) -> int:
+        """Size of the header within each sample."""
+        # modality_mask (4) + offsets (4 * N) + sizes (4 * N)
+        return 4 + 4 * self.num_modalities + 4 * self.num_modalities
+
+
+class UnifiedMultimodalWriter:
+    """
+    Writer for unified multimodal format.
+    """
+    
+    def __init__(self, format_spec: UnifiedMultimodalFormat, output_path: str):
+        self.format = format_spec
+        self.output_path = output_path
+        self.samples = []
+    
+    def add_sample(self, sample_data: Dict[str, Any]):
+        """Add a sample to the dataset."""
+        self.samples.append(sample_data)
+    
+    def finalize(self):
+        """Write the complete dataset."""
+        import io
+        
+        with open(self.output_path, 'wb') as f:
+            # Calculate header size
+            header_size = self._calculate_header_size()
+            index_size = len(self.samples) * self.format.sample_index_type.itemsize
+            
+            # Reserve space for header and index
+            f.seek(header_size + index_size)
+            
+            # Write samples and build index
+            sample_index = np.zeros(len(self.samples), dtype=self.format.sample_index_type)
+            
+            for i, sample_data in enumerate(self.samples):
+                sample_ptr = f.tell()
+                sample_bytes = self._encode_sample(sample_data)
+                f.write(sample_bytes)
+                
+                sample_index[i]['sample_ptr'] = sample_ptr
+                sample_index[i]['sample_size'] = len(sample_bytes)
+            
+            # Write header
+            f.seek(0)
+            self._write_header(f, len(self.samples))
+            
+            # Write index
+            f.write(sample_index.tobytes())
+    
+    def _encode_sample(self, sample_data: Dict[str, Any]) -> bytes:
+        """Encode all modalities for a sample."""
+        encoded = {}
+        modality_mask = 0
+        
+        for name, field in self.format.fields.items():
+            if name in sample_data and sample_data[name] is not None:
+                meta, data = field.encode(sample_data[name])
+                encoded[name] = (meta, data)
+                modality_mask |= self.format.modality_bits[name]
+            else:
+                encoded[name] = None
+        
+        # Build sample header
+        header_size = self.format._compute_sample_header_size()
+        offsets = np.zeros(self.format.num_modalities, dtype='<u4')
+        sizes = np.zeros(self.format.num_modalities, dtype='<u4')
+        
+        current_offset = header_size
+        for i, name in enumerate(self.format.modality_names):
+            if encoded[name] is not None:
+                meta, data = encoded[name]
+                total_size = meta.nbytes + len(data)
+                offsets[i] = current_offset
+                sizes[i] = total_size
+                current_offset += total_size
+        
+        # Pack sample
+        sample_header = struct.pack('<I', modality_mask) + offsets.tobytes() + sizes.tobytes()
+        
+        data_parts = [sample_header]
+        for name in self.format.modality_names:
+            if encoded[name] is not None:
+                meta, data = encoded[name]
+                data_parts.append(meta.tobytes())
+                data_parts.append(data)
+        
+        return b''.join(data_parts)
+    
+    def _calculate_header_size(self) -> int:
+        # magic(4) + version(2) + num_samples(4) + num_modalities(1) + descriptors
+        return 4 + 2 + 4 + 1 + self.format.num_modalities * self.format.modality_descriptor_type.itemsize
+    
+    def _write_header(self, f, num_samples: int):
+        f.write(self.format.MAGIC)
+        f.write(struct.pack('<H', self.format.VERSION))
+        f.write(struct.pack('<I', num_samples))
+        f.write(struct.pack('<B', self.format.num_modalities))
+        
+        for name, field in self.format.fields.items():
+            desc = np.zeros(1, dtype=self.format.modality_descriptor_type)[0]
+            desc['name_hash'] = hash(name) & 0xFFFFFFFF
+            desc['type_id'] = field.TYPE_ID
+            desc['metadata_size'] = field.metadata_type.itemsize
+            f.write(desc.tobytes())
+
+
+class UnifiedMultimodalReader:
+    """
+    Reader for unified multimodal format.
+    """
+    
+    def __init__(self, format_spec: UnifiedMultimodalFormat, file_path: str):
+        self.format = format_spec
+        self.file_path = file_path
+        
+        # Memory map the file
+        import mmap
+        self.file = open(file_path, 'rb')
+        self.mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+        
+        # Read header
+        self._read_header()
+    
+    def _read_header(self):
+        magic = self.mm[:4]
+        if magic != self.format.MAGIC:
+            raise ValueError(f"Invalid magic: {magic}")
+        
+        version, = struct.unpack('<H', self.mm[4:6])
+        self.num_samples, = struct.unpack('<I', self.mm[6:10])
+        self.num_modalities, = struct.unpack('<B', self.mm[10:11])
+        
+        # Read modality descriptors
+        desc_size = self.num_modalities * self.format.modality_descriptor_type.itemsize
+        header_end = 11 + desc_size
+        
+        # Read sample index
+        index_size = self.num_samples * self.format.sample_index_type.itemsize
+        self.sample_index = np.frombuffer(
+            self.mm[header_end:header_end + index_size],
+            dtype=self.format.sample_index_type
+        )
+    
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def read_sample(
         self,
-        header,
-        raw_data: bytes,
-        modalities_to_load: list = None
+        sample_id: int,
+        modalities: List[str] = None,
     ) -> Dict[str, Any]:
-        """Decode sample, optionally loading only specific modalities."""
+        """
+        Read a sample, optionally loading only specific modalities.
+        """
+        if modalities is None:
+            modalities = self.format.modality_names
         
-        if modalities_to_load is None:
-            modalities_to_load = self.modality_names
+        # Get sample location
+        sample_ptr = self.sample_index[sample_id]['sample_ptr']
+        sample_size = self.sample_index[sample_id]['sample_size']
         
-        # Parse offset table
-        offset_size = self.num_modalities * 4
-        offsets = np.frombuffer(raw_data[:offset_size], dtype='<u4')
-        sizes = np.frombuffer(raw_data[offset_size:offset_size*2], dtype='<u4')
+        sample_data = self.mm[sample_ptr:sample_ptr + sample_size]
         
-        data_start = offset_size * 2
+        return self._decode_sample(sample_data, modalities)
+    
+    def _decode_sample(self, sample_data: bytes, modalities: List[str]) -> Dict[str, Any]:
+        # Parse sample header
+        modality_mask, = struct.unpack('<I', sample_data[:4])
+        
+        n = self.format.num_modalities
+        offsets = np.frombuffer(sample_data[4:4 + 4*n], dtype='<u4')
+        sizes = np.frombuffer(sample_data[4 + 4*n:4 + 8*n], dtype='<u4')
         
         result = {}
-        for i, name in enumerate(self.modality_names):
-            if name not in modalities_to_load:
+        for i, name in enumerate(self.format.modality_names):
+            if name not in modalities:
                 continue
             
-            if sizes[i] == 0:
+            if not (modality_mask & self.format.modality_bits[name]):
                 result[name] = None
                 continue
             
             # Extract modality data
-            start = data_start + offsets[i]
+            start = offsets[i]
             end = start + sizes[i]
-            modality_bytes = raw_data[start:end]
+            modality_bytes = sample_data[start:end]
             
-            # Decode
-            field = self.fields[name]
-            result[name] = field.decode(modality_bytes)
+            # Decode using field
+            field = self.format.fields[name]
+            meta_size = field.metadata_type.itemsize
+            meta = np.frombuffer(modality_bytes[:meta_size], dtype=field.metadata_type)[0]
+            data = modality_bytes[meta_size:]
+            
+            result[name] = field.decode(meta, data)
         
         return result
+    
+    def close(self):
+        self.mm.close()
+        self.file.close()
 ```
 
-### Strategy 2: Separate Streams per Modality
+## Architecture 2: Separate Streams per Modality
 
-Each modality in its own region of the file:
+For maximum flexibility, store each modality in its own region.
 
 ```python
-class SeparateStreamFormat:
+class SeparateStreamsFormat:
     """
-    Store each modality in its own region of the file.
+    Store each modality in a separate region of the file.
     
     File Layout:
-    ┌─────────────────────────────────────────────┐
-    │ Global Header                               │
-    │ ├─ num_samples                             │
-    │ ├─ num_modalities                          │
-    │ └─ stream_descriptors[]                    │
-    ├─────────────────────────────────────────────┤
-    │ Stream 0: Images                            │
-    │ ├─ Image metadata table                    │
-    │ └─ Image data region                       │
-    ├─────────────────────────────────────────────┤
-    │ Stream 1: Text                              │
-    │ ├─ Text metadata table                     │
-    │ └─ Text data region                        │
-    ├─────────────────────────────────────────────┤
-    │ Stream 2: Audio                             │
-    │ ├─ Audio metadata table                    │
-    │ └─ Audio data region                       │
-    └─────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │ File Header                                                             │
+    │ ├─ magic: bytes[4] = "MSTR"                                            │
+    │ ├─ num_samples: uint32                                                 │
+    │ ├─ num_streams: uint8                                                  │
+    │ └─ stream_table: StreamDescriptor[num_streams]                         │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Stream 0: "image"                                                       │
+    │ ├─ Metadata Table (num_samples × metadata_size)                        │
+    │ └─ Data Region                                                          │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Stream 1: "text"                                                        │
+    │ ├─ Metadata Table                                                       │
+    │ └─ Data Region                                                          │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ ...                                                                     │
+    └─────────────────────────────────────────────────────────────────────────┘
     
-    Pros:
-    - Load only needed modalities
-    - Each stream can be optimized independently
-    - Better for heterogeneous access patterns
+    Advantages:
+    ✓ Load only needed modalities (skip entire streams)
+    ✓ Each stream optimized independently
+    ✓ Can add new modalities without rewriting others
+    ✓ Better for heterogeneous access patterns
     
-    Cons:
-    - Multiple seeks for full sample
-    - More complex indexing
+    Disadvantages:
+    ✗ Multiple seeks for full sample
+    ✗ More complex indexing
+    ✗ Worse cache locality when loading all modalities
     """
+    
+    MAGIC = b'MSTR'
     
     @property
     def stream_descriptor_type(self) -> np.dtype:
         return np.dtype([
-            ('modality_id', '<u1'),
-            ('modality_type', '<u1'),
+            ('name_hash', '<u4'),
+            ('type_id', '<u2'),
+            ('_pad', '<u2'),
             ('metadata_ptr', '<u8'),
             ('metadata_size', '<u4'),
             ('data_ptr', '<u8'),
@@ -220,111 +395,137 @@ class SeparateStreamFormat:
     
     def __init__(self, modality_fields: Dict[str, 'Field']):
         self.fields = modality_fields
-        self.streams = {}
+        self.modality_names = list(modality_fields.keys())
+
+
+class SeparateStreamsReader:
+    """
+    Reader that can selectively load modalities.
+    """
     
-    def write(self, samples: list, output_path: str):
-        """Write multimodal dataset."""
+    def __init__(self, format_spec: SeparateStreamsFormat, file_path: str):
+        self.format = format_spec
+        self.file_path = file_path
         
-        # Collect data by modality
-        modality_data = {name: [] for name in self.fields}
+        import mmap
+        self.file = open(file_path, 'rb')
+        self.mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
         
-        for sample in samples:
-            for name in self.fields:
-                modality_data[name].append(sample.get(name))
-        
-        # Write each modality stream
-        with open(output_path, 'wb') as f:
-            # Reserve space for header
-            header_size = self._calculate_header_size()
-            f.seek(header_size)
-            
-            stream_info = []
-            
-            for name, field in self.fields.items():
-                data_list = modality_data[name]
-                
-                # Write stream
-                metadata_ptr = f.tell()
-                metadata, data_ptr, data_size = self._write_stream(
-                    f, field, data_list
-                )
-                
-                stream_info.append({
-                    'name': name,
-                    'metadata_ptr': metadata_ptr,
-                    'metadata_size': len(metadata),
-                    'data_ptr': data_ptr,
-                    'data_size': data_size
-                })
-            
-            # Write header
-            f.seek(0)
-            self._write_header(f, len(samples), stream_info)
+        self._read_header()
+        self._load_stream_metadata()
     
-    def read_stream(
-        self,
-        file_path: str,
-        modality: str,
-        sample_indices: list = None
-    ):
-        """Read specific modality for samples."""
+    def _read_header(self):
+        # ... (similar to UnifiedMultimodalReader)
+        pass
+    
+    def _load_stream_metadata(self):
+        """
+        Load metadata tables for all streams.
         
-        with open(file_path, 'rb') as f:
-            # Read header
-            header = self._read_header(f)
+        This enables fast sample lookup without reading data.
+        """
+        self.metadata_tables = {}
+        
+        for name, desc in self.stream_descriptors.items():
+            field = self.format.fields[name]
             
-            # Find stream
-            stream = header['streams'][modality]
+            # Memory-map the metadata table
+            start = desc['metadata_ptr']
+            size = self.num_samples * field.metadata_type.itemsize
             
-            # Read metadata table
-            f.seek(stream['metadata_ptr'])
-            metadata = np.fromfile(
-                f,
-                dtype=self.fields[modality].metadata_type,
-                count=header['num_samples']
+            self.metadata_tables[name] = np.frombuffer(
+                self.mm[start:start + size],
+                dtype=field.metadata_type
             )
+    
+    def read_modality(
+        self,
+        modality: str,
+        sample_ids: np.ndarray,
+    ) -> List[Any]:
+        """
+        Read a single modality for multiple samples.
+        
+        This is efficient because we only touch one stream.
+        """
+        field = self.format.fields[modality]
+        metadata = self.metadata_tables[modality]
+        
+        results = []
+        for sample_id in sample_ids:
+            meta = metadata[sample_id]
+            ptr = meta['data_ptr']
+            size = meta['data_size']
             
-            # Read requested samples
-            if sample_indices is None:
-                sample_indices = range(header['num_samples'])
-            
-            results = []
-            for idx in sample_indices:
-                meta = metadata[idx]
-                data = self._read_sample_data(f, stream, meta)
-                decoded = self.fields[modality].decode(data)
-                results.append(decoded)
-            
-            return results
+            data = self.mm[ptr:ptr + size]
+            decoded = field.decode(meta, data)
+            results.append(decoded)
+        
+        return results
+    
+    def read_sample(
+        self,
+        sample_id: int,
+        modalities: List[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Read multiple modalities for a sample.
+        """
+        if modalities is None:
+            modalities = self.format.modality_names
+        
+        result = {}
+        for name in modalities:
+            items = self.read_modality(name, np.array([sample_id]))
+            result[name] = items[0]
+        
+        return result
 ```
 
 ## Video + Audio Synchronization
 
-Critical for video understanding:
+The most common multimodal sync challenge: aligning video frames with audio samples.
 
 ```python
 class SyncedVideoAudioField:
     """
-    Store video and audio with precise synchronization.
+    Store video and audio with precise temporal synchronization.
     
-    Synchronization strategy:
-    - Store audio at original sample rate
-    - Store video at original frame rate
-    - Record precise timing for both
-    - Provide aligned access APIs
+    The challenge: video runs at 30 fps (33ms per frame), audio at 16000 Hz
+    (0.0625ms per sample). They don't divide evenly!
+    
+    Solution: Store both at their native rates with a shared timeline.
+    
+    Sample Timeline:
+    ┌───────────────────────────────────────────────────────────────────────────┐
+    │  Time (ms):  0    33    66   100   133   166   200   233   266   300     │
+    │  Video:      F0   F1    F2   F3    F4    F5    F6    F7    F8    F9      │
+    │  Audio:      [████████████████████████████████████████████████████████]  │
+    │              0                         2400                        4800  │
+    │              samples                                              samples │
+    └───────────────────────────────────────────────────────────────────────────┘
+    
+    Each video frame corresponds to audio samples in the range:
+    Frame i: audio[ floor(i * sr / fps) : floor((i+1) * sr / fps) ]
     """
     
-    type_id = 30
+    TYPE_ID = 50
     
     def __init__(
         self,
         video_fps: float = 30.0,
         audio_sample_rate: int = 16000,
-        max_duration: float = 10.0
+        max_frames: int = 300,           # 10 seconds at 30fps
+        frame_height: int = 224,
+        frame_width: int = 224,
+        jpeg_quality: int = 90,
     ):
         self.video_fps = video_fps
         self.audio_sr = audio_sample_rate
-        self.max_duration = max_duration
+        self.max_frames = max_frames
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.jpeg_quality = jpeg_quality
     
     @property
     def metadata_type(self) -> np.dtype:
@@ -332,245 +533,264 @@ class SyncedVideoAudioField:
             ('clip_id', '<u4'),
             ('duration_ms', '<u4'),
             
-            # Video info
+            # Video
             ('video_ptr', '<u8'),
             ('video_size', '<u4'),
             ('num_frames', '<u2'),
-            ('video_fps', '<f4'),
-            ('frame_width', '<u2'),
             ('frame_height', '<u2'),
+            ('frame_width', '<u2'),
+            ('video_fps', '<f4'),
             
-            # Audio info
+            # Audio
             ('audio_ptr', '<u8'),
             ('audio_size', '<u4'),
             ('num_audio_samples', '<u4'),
             ('audio_sample_rate', '<u4'),
-            ('num_audio_channels', '<u1'),
             
-            # Sync info
-            ('audio_offset_ms', '<i4'),  # Audio delay relative to video
+            # Sync
+            ('audio_offset_samples', '<i4'),  # Audio delay (positive = audio behind)
         ], align=True)
     
     def encode(
         self,
-        video_path: str,
-        audio_path: str = None,
-        start_time: float = 0
+        video_frames: np.ndarray,     # (T, H, W, 3) uint8
+        audio: np.ndarray,            # (num_samples,) float32
+        audio_offset_ms: float = 0.0, # Sync offset in milliseconds
     ) -> Tuple[np.ndarray, bytes]:
-        """Encode synchronized video and audio."""
+        """
+        Encode synchronized video and audio.
+        """
+        from turbojpeg import TurboJPEG
         import cv2
-        import soundfile as sf
         
-        # Extract video frames
-        cap = cv2.VideoCapture(video_path)
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        jpeg = TurboJPEG()
+        num_frames = min(len(video_frames), self.max_frames)
         
-        # Calculate frame indices for target fps
-        duration = min(
-            cap.get(cv2.CAP_PROP_FRAME_COUNT) / original_fps - start_time,
-            self.max_duration
-        )
-        
-        num_frames = int(duration * self.video_fps)
-        frame_times = np.linspace(0, duration, num_frames)
-        
-        # Read frames
-        frames_data = []
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-        
-        for t in frame_times:
-            cap.set(cv2.CAP_PROP_POS_MSEC, (start_time + t) * 1000)
-            ret, frame = cap.read()
-            if ret:
-                # Encode as JPEG
-                _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                frames_data.append(jpeg.tobytes())
-        
-        cap.release()
-        
-        # Load audio
-        if audio_path is None:
-            # Extract from video
-            import subprocess
-            import tempfile
+        # Encode video frames
+        frame_data = []
+        for i in range(num_frames):
+            frame = video_frames[i]
             
-            with tempfile.NamedTemporaryFile(suffix='.wav') as tmp:
-                subprocess.run([
-                    'ffmpeg', '-i', video_path,
-                    '-ss', str(start_time),
-                    '-t', str(duration),
-                    '-ar', str(self.audio_sr),
-                    '-ac', '1',
-                    '-y', tmp.name
-                ], check=True, capture_output=True)
-                audio, _ = sf.read(tmp.name)
-        else:
-            audio, orig_sr = sf.read(audio_path)
-            # Resample if needed
-            if orig_sr != self.audio_sr:
-                import librosa
-                audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=self.audio_sr)
+            # Resize if needed
+            if frame.shape[0] != self.frame_height or frame.shape[1] != self.frame_width:
+                frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+            
+            jpeg_bytes = jpeg.encode(frame, quality=self.jpeg_quality)
+            frame_data.append(jpeg_bytes)
+        
+        # Build frame index
+        frame_offsets = np.zeros(num_frames, dtype='<u4')
+        frame_sizes = np.zeros(num_frames, dtype='<u4')
+        
+        offset = num_frames * 8  # After index
+        for i, data in enumerate(frame_data):
+            frame_offsets[i] = offset
+            frame_sizes[i] = len(data)
+            offset += len(data)
+        
+        video_bytes = frame_offsets.tobytes() + frame_sizes.tobytes() + b''.join(frame_data)
         
         # Encode audio
         audio_bytes = audio.astype(np.float32).tobytes()
         
-        # Build frame index
-        frame_sizes = np.array([len(f) for f in frames_data], dtype='<u4')
-        frame_offsets = np.cumsum([0] + list(frame_sizes[:-1])).astype('<u4')
+        # Combine
+        all_data = video_bytes + audio_bytes
         
-        # Pack video data: [frame_offsets | frame_sizes | frame_data]
-        video_header = frame_offsets.tobytes() + frame_sizes.tobytes()
-        video_data = video_header + b''.join(frames_data)
+        # Calculate duration
+        duration_ms = int(num_frames / self.video_fps * 1000)
         
-        # Combine: video_data + audio_data
-        all_data = video_data + audio_bytes
-        
-        # Metadata
+        # Create metadata
         meta = np.zeros(1, dtype=self.metadata_type)[0]
-        meta['duration_ms'] = int(duration * 1000)
-        meta['num_frames'] = len(frames_data)
+        meta['duration_ms'] = duration_ms
+        meta['video_ptr'] = 0  # Filled by writer
+        meta['video_size'] = len(video_bytes)
+        meta['num_frames'] = num_frames
+        meta['frame_height'] = self.frame_height
+        meta['frame_width'] = self.frame_width
         meta['video_fps'] = self.video_fps
-        meta['video_size'] = len(video_data)
+        meta['audio_ptr'] = len(video_bytes)  # Relative offset
+        meta['audio_size'] = len(audio_bytes)
         meta['num_audio_samples'] = len(audio)
         meta['audio_sample_rate'] = self.audio_sr
-        meta['audio_size'] = len(audio_bytes)
-        meta['audio_offset_ms'] = 0  # Assume sync'd
+        meta['audio_offset_samples'] = int(audio_offset_ms * self.audio_sr / 1000)
         
         return meta, all_data
+    
+    def get_decoder_class(self):
+        return SyncedVideoAudioDecoder
 
 
 class SyncedVideoAudioDecoder:
     """
-    Decoder that returns aligned video and audio.
+    Decoder that provides synchronized video and audio access.
     """
     
-    def __init__(self, target_frames: int = 16, target_audio_len: int = None):
+    def __init__(
+        self,
+        field: SyncedVideoAudioField,
+        metadata: np.ndarray,
+        memory_read,
+        target_frames: int = 16,
+    ):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
         self.target_frames = target_frames
-        self.target_audio_len = target_audio_len
     
-    def decode(self, metadata, read_fn) -> Dict[str, np.ndarray]:
-        """Decode with temporal alignment."""
+    def generate_code(self):
+        metadata = self.metadata
+        mem_read = self.memory_read
+        target_frames = self.target_frames
+        
         from turbojpeg import TurboJPEG
         jpeg = TurboJPEG()
         
-        # Read all data
-        total_size = metadata['video_size'] + metadata['audio_size']
-        data = read_fn(metadata['data_ptr'], total_size)
+        def decode(batch_indices, video_dest, audio_dest, metadata_arg, storage_state):
+            """
+            Decode synchronized video and audio.
+            
+            Returns:
+                video_dest: (batch, T, H, W, C)
+                audio_dest: (batch, num_samples)
+            """
+            for batch_idx in range(len(batch_indices)):
+                sample_id = batch_indices[batch_idx]
+                meta = metadata[sample_id]
+                
+                ptr = meta['video_ptr']  # Global pointer (set by writer)
+                video_size = meta['video_size']
+                audio_size = meta['audio_size']
+                num_frames = meta['num_frames']
+                
+                # Read all data
+                total_size = video_size + audio_size
+                data = mem_read(ptr, storage_state)[:total_size]
+                
+                video_data = data[:video_size]
+                audio_data = data[video_size:]
+                
+                # Parse video frame index
+                frame_offsets = np.frombuffer(video_data[:num_frames * 4], dtype='<u4')
+                frame_sizes = np.frombuffer(video_data[num_frames * 4:num_frames * 8], dtype='<u4')
+                
+                # Sample frames uniformly to target_frames
+                if num_frames > target_frames:
+                    indices = np.linspace(0, num_frames - 1, target_frames).astype(int)
+                else:
+                    indices = np.arange(num_frames)
+                
+                # Decode selected frames
+                for i, frame_idx in enumerate(indices):
+                    offset = frame_offsets[frame_idx]
+                    size = frame_sizes[frame_idx]
+                    
+                    jpeg_bytes = bytes(video_data[offset:offset + size])
+                    frame = jpeg.decode(jpeg_bytes)
+                    
+                    video_dest[batch_idx, i] = frame
+                
+                # Zero-pad remaining frames
+                for i in range(len(indices), target_frames):
+                    video_dest[batch_idx, i] = 0
+                
+                # Decode audio
+                audio = np.frombuffer(audio_data, dtype=np.float32)
+                audio_dest[batch_idx, :len(audio)] = audio
+                audio_dest[batch_idx, len(audio):] = 0
+            
+            return video_dest, audio_dest
         
-        # Split video and audio
-        video_data = data[:metadata['video_size']]
-        audio_data = data[metadata['video_size']:]
+        return decode
+    
+    def get_aligned_audio(
+        self,
+        sample_id: int,
+        frame_indices: np.ndarray,
+    ) -> List[np.ndarray]:
+        """
+        Get audio segments aligned to specific video frames.
         
-        # Parse video frames
-        num_frames = metadata['num_frames']
-        header_size = num_frames * 8  # offsets + sizes
+        Returns a list of audio arrays, one per frame.
+        """
+        meta = self.metadata[sample_id]
         
-        frame_offsets = np.frombuffer(video_data[:num_frames*4], dtype='<u4')
-        frame_sizes = np.frombuffer(video_data[num_frames*4:header_size], dtype='<u4')
-        frame_data = video_data[header_size:]
+        fps = meta['video_fps']
+        sr = meta['audio_sample_rate']
+        offset = meta['audio_offset_samples']
         
-        # Sample frames uniformly
-        if num_frames > self.target_frames:
-            indices = np.linspace(0, num_frames - 1, self.target_frames).astype(int)
-        else:
-            indices = np.arange(num_frames)
-        
-        # Decode selected frames
-        frames = []
-        for idx in indices:
-            start = frame_offsets[idx]
-            size = frame_sizes[idx]
-            jpeg_bytes = bytes(frame_data[start:start + size])
-            frame = jpeg.decode(jpeg_bytes)
-            frames.append(frame)
-        
-        video_tensor = np.stack(frames)  # (T, H, W, C)
-        
-        # Decode audio
+        # Read audio
+        ptr = meta['video_ptr'] + meta['video_size']
+        audio_data = self.memory_read(ptr, None)[:meta['audio_size']]
         audio = np.frombuffer(audio_data, dtype=np.float32)
         
-        # Align audio to selected frames
-        duration = metadata['duration_ms'] / 1000.0
-        sr = metadata['audio_sample_rate']
-        
-        # Calculate audio segments for each frame
-        audio_segments = []
-        for i, idx in enumerate(indices):
-            frame_time = idx / metadata['video_fps']
-            next_frame_time = (indices[i+1] / metadata['video_fps']) if i+1 < len(indices) else duration
+        segments = []
+        for frame_idx in frame_indices:
+            # Time range for this frame
+            t_start = frame_idx / fps
+            t_end = (frame_idx + 1) / fps
             
-            start_sample = int(frame_time * sr)
-            end_sample = int(next_frame_time * sr)
+            # Convert to sample indices, applying offset
+            sample_start = max(0, int(t_start * sr) + offset)
+            sample_end = min(len(audio), int(t_end * sr) + offset)
             
-            segment = audio[start_sample:end_sample]
-            audio_segments.append(segment)
+            segments.append(audio[sample_start:sample_end])
         
-        return {
-            'video': video_tensor,          # (T, H, W, C)
-            'audio': audio,                  # (num_samples,)
-            'audio_segments': audio_segments,# List of per-frame audio
-            'frame_times': indices / metadata['video_fps'],
-            'duration': duration
-        }
+        return segments
 ```
 
-## Image + Text Pairs
-
-For vision-language models:
+## Image + Text Pairs (CLIP-style)
 
 ```python
 class ImageTextPairField:
     """
-    Store image-text pairs (for CLIP, BLIP, etc.).
+    Optimized storage for image-text pairs.
     
-    Optimizations:
-    - Pre-tokenize text
-    - Store image in optimal format for training resolution
-    - Include alignment score if available
+    Used for vision-language models like CLIP, BLIP, LLaVA.
+    
+    Pre-tokenize text and pre-compute optional metadata like CLIP scores.
     """
     
-    type_id = 31
+    TYPE_ID = 51
     
     def __init__(
         self,
+        tokenizer,
         image_size: Tuple[int, int] = (224, 224),
-        max_text_length: int = 77,  # CLIP default
-        tokenizer = None,
-        store_raw_text: bool = False
+        max_tokens: int = 77,           # CLIP default
+        jpeg_quality: int = 95,
+        store_clip_score: bool = False,
     ):
-        self.image_size = image_size
-        self.max_text_length = max_text_length
         self.tokenizer = tokenizer
-        self.store_raw_text = store_raw_text
+        self.image_height, self.image_width = image_size
+        self.max_tokens = max_tokens
+        self.jpeg_quality = jpeg_quality
+        self.store_clip_score = store_clip_score
     
     @property
     def metadata_type(self) -> np.dtype:
-        return np.dtype([
+        fields = [
             ('pair_id', '<u4'),
             
             # Image
             ('image_ptr', '<u8'),
             ('image_size', '<u4'),
-            ('image_height', '<u2'),
-            ('image_width', '<u2'),
             
-            # Text (tokenized)
+            # Text (pre-tokenized)
             ('token_ptr', '<u8'),
             ('num_tokens', '<u2'),
-            
-            # Optional raw text
-            ('raw_text_ptr', '<u8'),
-            ('raw_text_size', '<u4'),
-            
-            # Alignment
-            ('clip_score', '<f4'),  # Pre-computed CLIP similarity
-        ], align=True)
+            ('_pad', '<u2'),
+        ]
+        
+        if self.store_clip_score:
+            fields.append(('clip_score', '<f4'))
+        
+        return np.dtype(fields, align=True)
     
     def encode(
         self,
         image: np.ndarray,
         text: str,
-        clip_score: float = 0.0
+        clip_score: float = None,
     ) -> Tuple[np.ndarray, bytes]:
         """Encode image-text pair."""
         from turbojpeg import TurboJPEG
@@ -579,34 +799,32 @@ class ImageTextPairField:
         jpeg = TurboJPEG()
         
         # Resize and encode image
-        h, w = self.image_size
-        image_resized = cv2.resize(image, (w, h))
-        image_bytes = jpeg.encode(image_resized, quality=95)
+        if image.shape[0] != self.image_height or image.shape[1] != self.image_width:
+            image = cv2.resize(image, (self.image_width, self.image_height))
+        
+        image_bytes = jpeg.encode(image, quality=self.jpeg_quality)
         
         # Tokenize text
-        tokens = self.tokenizer(
+        tokens = self.tokenizer.encode(
             text,
             truncation=True,
-            max_length=self.max_text_length,
-            padding=False
-        )['input_ids']
-        token_array = np.array(tokens, dtype=np.int32)
+            max_length=self.max_tokens,
+        )
+        token_array = np.array(tokens, dtype='<u2')  # uint16 for most vocabs
         token_bytes = token_array.tobytes()
         
-        # Optional raw text
-        raw_text_bytes = text.encode('utf-8') if self.store_raw_text else b''
-        
         # Combine
-        all_data = image_bytes + token_bytes + raw_text_bytes
+        all_data = image_bytes + token_bytes
         
         # Metadata
         meta = np.zeros(1, dtype=self.metadata_type)[0]
+        meta['image_ptr'] = 0
         meta['image_size'] = len(image_bytes)
-        meta['image_height'] = h
-        meta['image_width'] = w
+        meta['token_ptr'] = len(image_bytes)
         meta['num_tokens'] = len(tokens)
-        meta['raw_text_size'] = len(raw_text_bytes)
-        meta['clip_score'] = clip_score
+        
+        if self.store_clip_score and clip_score is not None:
+            meta['clip_score'] = clip_score
         
         return meta, all_data
 
@@ -616,104 +834,107 @@ class ImageTextDecoder:
     
     def __init__(
         self,
-        max_text_length: int = 77,
-        return_raw_text: bool = False
+        field: ImageTextPairField,
+        metadata: np.ndarray,
+        memory_read,
     ):
-        self.max_text_length = max_text_length
-        self.return_raw_text = return_raw_text
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
+        
+        self.max_tokens = field.max_tokens
+        self.pad_token_id = field.tokenizer.pad_token_id or 0
     
-    def decode(self, metadata, read_fn) -> dict:
+    def generate_code(self):
+        metadata = self.metadata
+        mem_read = self.memory_read
+        max_tokens = self.max_tokens
+        pad_id = self.pad_token_id
+        
         from turbojpeg import TurboJPEG
         jpeg = TurboJPEG()
         
-        # Calculate total size
-        total_size = (
-            metadata['image_size'] +
-            metadata['num_tokens'] * 4 +
-            metadata['raw_text_size']
-        )
+        def decode(batch_indices, image_dest, token_dest, mask_dest, metadata_arg, storage_state):
+            for batch_idx in range(len(batch_indices)):
+                sample_id = batch_indices[batch_idx]
+                meta = metadata[sample_id]
+                
+                ptr = meta['image_ptr']
+                image_size = meta['image_size']
+                num_tokens = meta['num_tokens']
+                
+                # Read data
+                total_size = image_size + num_tokens * 2
+                data = mem_read(ptr, storage_state)[:total_size]
+                
+                # Decode image
+                image_bytes = bytes(data[:image_size])
+                image = jpeg.decode(image_bytes)
+                image_dest[batch_idx] = image
+                
+                # Decode tokens
+                tokens = np.frombuffer(data[image_size:], dtype='<u2')
+                
+                # Pad tokens
+                token_dest[batch_idx, :num_tokens] = tokens
+                token_dest[batch_idx, num_tokens:] = pad_id
+                
+                # Create attention mask
+                mask_dest[batch_idx, :num_tokens] = 1
+                mask_dest[batch_idx, num_tokens:] = 0
+            
+            return image_dest, token_dest, mask_dest
         
-        data = read_fn(metadata['data_ptr'], total_size)
-        
-        # Parse image
-        image_end = metadata['image_size']
-        image_bytes = bytes(data[:image_end])
-        image = jpeg.decode(image_bytes)
-        
-        # Parse tokens
-        token_end = image_end + metadata['num_tokens'] * 4
-        tokens = np.frombuffer(data[image_end:token_end], dtype=np.int32)
-        
-        # Pad tokens
-        input_ids = np.zeros(self.max_text_length, dtype=np.int64)
-        attention_mask = np.zeros(self.max_text_length, dtype=np.int64)
-        
-        num_tokens = min(len(tokens), self.max_text_length)
-        input_ids[:num_tokens] = tokens[:num_tokens]
-        attention_mask[:num_tokens] = 1
-        
-        result = {
-            'image': image,  # (H, W, C)
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'clip_score': metadata['clip_score']
-        }
-        
-        if self.return_raw_text and metadata['raw_text_size'] > 0:
-            raw_text = bytes(data[token_end:]).decode('utf-8')
-            result['text'] = raw_text
-        
-        return result
+        return decode
 ```
 
-## Multimodal Collator
+## Multimodal Collation
 
 ```python
 class MultimodalCollator:
     """
-    Collate multimodal samples into batches.
-    Handles different padding/stacking for each modality.
+    Collate multimodal batches with modality-specific handling.
     """
     
-    def __init__(
-        self,
-        modality_configs: Dict[str, dict],
-        return_tensors: str = 'np'
-    ):
+    def __init__(self, modality_configs: Dict[str, Dict]):
         """
-        modality_configs example:
-        {
-            'image': {'stack': True},
-            'input_ids': {'pad_value': 0, 'max_length': 77},
-            'audio': {'pad_value': 0.0, 'max_length': 16000}
-        }
+        Args:
+            modality_configs: Dict mapping modality name to config.
+                Example:
+                {
+                    'image': {'type': 'stack'},
+                    'video': {'type': 'stack'},
+                    'input_ids': {'type': 'pad', 'pad_value': 0, 'max_length': 77},
+                    'audio': {'type': 'pad', 'pad_value': 0.0, 'max_length': 16000},
+                }
         """
         self.configs = modality_configs
-        self.return_tensors = return_tensors
     
-    def __call__(self, samples: list) -> dict:
+    def __call__(self, samples: List[Dict]) -> Dict[str, np.ndarray]:
         batch = {}
         
         for modality, config in self.configs.items():
-            values = [s[modality] for s in samples if modality in s]
+            values = [s[modality] for s in samples if modality in s and s[modality] is not None]
             
             if not values:
                 continue
             
-            if config.get('stack', False):
-                # Stack arrays directly
+            collate_type = config.get('type', 'stack')
+            
+            if collate_type == 'stack':
                 batch[modality] = np.stack(values)
             
-            elif 'pad_value' in config:
-                # Pad sequences
+            elif collate_type == 'pad':
+                pad_value = config['pad_value']
                 max_len = config.get('max_length', max(len(v) for v in values))
-                pad_val = config['pad_value']
                 
-                padded = np.full(
-                    (len(values), max_len),
-                    pad_val,
-                    dtype=values[0].dtype
-                )
+                # Determine shape
+                if values[0].ndim == 1:
+                    shape = (len(values), max_len)
+                else:
+                    shape = (len(values), max_len) + values[0].shape[1:]
+                
+                padded = np.full(shape, pad_value, dtype=values[0].dtype)
                 
                 for i, v in enumerate(values):
                     length = min(len(v), max_len)
@@ -725,69 +946,15 @@ class MultimodalCollator:
                 # Return as list
                 batch[modality] = values
         
-        if self.return_tensors == 'pt':
-            import torch
-            batch = {
-                k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
-                for k, v in batch.items()
-            }
-        
         return batch
 ```
 
-## Complete Multimodal Loader
+## Exercises
 
-```python
-class MultimodalLoader:
-    """
-    DataLoader for multimodal datasets.
-    """
-    
-    def __init__(
-        self,
-        reader,
-        modalities: list,
-        batch_size: int = 32,
-        shuffle: bool = True,
-        num_workers: int = 4,
-        collator = None
-    ):
-        self.reader = reader
-        self.modalities = modalities
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.num_workers = num_workers
-        self.collator = collator or MultimodalCollator({})
-    
-    def __iter__(self):
-        indices = np.arange(len(self.reader))
-        
-        if self.shuffle:
-            np.random.shuffle(indices)
-        
-        # Create batches
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start:start + self.batch_size]
-            
-            # Load samples
-            samples = []
-            for idx in batch_indices:
-                sample = self.reader.read_sample(
-                    idx,
-                    modalities=self.modalities
-                )
-                samples.append(sample)
-            
-            # Collate
-            batch = self.collator(samples)
-            
-            yield batch
-    
-    def __len__(self):
-        return (len(self.reader) + self.batch_size - 1) // self.batch_size
-```
+1.  **Implement Document AI Field**: Create a field for storing scanned documents with OCR text, bounding boxes, and labels.
 
-## Next Steps
+2.  **Temporal Alignment Benchmark**: Measure the accuracy of video-to-audio alignment with different sync offset values.
 
-- See [02_modality_alignment.md](02_modality_alignment.md) for temporal alignment
-- See [03_cross_modal_retrieval.md](03_cross_modal_retrieval.md) for retrieval indices
+3.  **Selective Loading**: Benchmark the speedup of loading only text vs. loading both image and text in a CLIP dataset.
+
+4.  **Missing Modality Handling**: Extend the decoder to handle samples with missing modalities (e.g., video without audio).

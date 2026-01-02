@@ -1,660 +1,847 @@
 # Text Field Design: From Strings to Token Streams
 
-## Text Data Characteristics
+## Understanding Text Data
 
-Text is unique among modalities:
+Text is fundamentally different from images or audio. It's **symbolic** (discrete tokens) rather than signal-based (continuous values), and it has highly variable length.
+
+### The Scale of Text
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     TEXT DATA CHARACTERISTICS                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Property 1: HIGHLY VARIABLE LENGTH                                     │
-│  ──────────────────────────────────                                      │
-│                                                                          │
-│  • Tweet: ~50 chars                                                      │
-│  • Document: 10,000+ chars                                              │
-│  • Book: 500,000+ chars                                                 │
-│                                                                          │
-│  Property 2: MULTIPLE REPRESENTATIONS                                   │
-│  ────────────────────────────────────                                   │
-│                                                                          │
-│  Raw String  →  "Hello, world!"                                         │
-│  UTF-8 Bytes →  [72, 101, 108, 108, 111, 44, 32, ...]                  │
-│  Token IDs   →  [15496, 11, 995, 0]  (GPT-2 tokenizer)                 │
-│  Embeddings  →  [[0.1, -0.3, ...], [...], ...]  float32                │
-│                                                                          │
-│  Property 3: PREPROCESSING IS EXPENSIVE                                 │
-│  ──────────────────────────────────────                                 │
-│                                                                          │
-│  Tokenization can be 10-100x slower than reading from disk!            │
-│  → Pre-tokenize and store token IDs                                    │
-│                                                                          │
-│  Property 4: PADDING OVERHEAD                                           │
-│  ───────────────────────────────                                         │
-│                                                                          │
-│  Batch of sequences with max_length=512:                                │
-│  • Sequence lengths: [23, 156, 89, 512, 45]                            │
-│  • Average padding: 70%+ wasted memory!                                 │
-│  → Use packing or dynamic batching                                      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        TEXT DATA CHARACTERISTICS                               │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  LENGTH VARIABILITY:                                                           │
+│  ───────────────────                                                           │
+│                                                                                │
+│  Content Type          Characters    Tokens (GPT-4)    Storage                │
+│  ────────────          ──────────    ──────────────    ───────                │
+│  Tweet                 280           ~50-100           ~300 B                  │
+│  Email                 1,000         ~200-500          ~1 KB                   │
+│  News article          5,000         ~1,000-2,000      ~5 KB                   │
+│  Research paper        40,000        ~8,000-15,000     ~40 KB                  │
+│  Novel                 500,000       ~100,000-200,000  ~500 KB                 │
+│  Wikipedia dump        22 GB         ~5B tokens        ~22 GB                  │
+│                                                                                │
+│  TOKENIZATION METHODS:                                                         │
+│  ─────────────────────                                                         │
+│                                                                                │
+│  Word-level:      "Hello world" → ["Hello", "world"]                          │
+│                   Vocab size: ~50,000-200,000                                  │
+│                   Problem: OOV (out-of-vocabulary) words                       │
+│                                                                                │
+│  Character-level: "Hello" → ["H", "e", "l", "l", "o"]                         │
+│                   Vocab size: ~100-500                                         │
+│                   Problem: Very long sequences                                 │
+│                                                                                │
+│  Subword (BPE):   "unbelievable" → ["un", "believ", "able"]                   │
+│                   Vocab size: ~30,000-100,000                                  │
+│                   Best balance of vocab size and sequence length               │
+│                                                                                │
+│  TOKENIZATION OVERHEAD:                                                        │
+│  ──────────────────────                                                        │
+│                                                                                │
+│  Tokenizer           Throughput (tokens/sec)    Latency per doc               │
+│  ─────────           ─────────────────────────  ──────────────                │
+│  HuggingFace (slow)  100,000-500,000            1-10 ms                       │
+│  HuggingFace (fast)  1,000,000-5,000,000        0.1-1 ms                      │
+│  tiktoken            5,000,000-20,000,000       0.05-0.2 ms                   │
+│                                                                                │
+│  For large-scale training, PRE-TOKENIZE AND STORE TOKEN IDs!                 │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Text Storage Strategies
+### The Padding Problem
 
-### Strategy 1: Raw UTF-8 Bytes
+Transformers require fixed-length inputs within a batch. Naive padding wastes compute and memory:
 
-Simple but requires tokenization at load time:
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         THE PADDING PROBLEM                                    │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  Batch of 4 sequences (padded to max_length=512):                             │
+│                                                                                │
+│  Sequence 1: [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  len=50/512  (90% pad)│
+│  Sequence 2: [█████████████████████████████░░░░░░░░░░░░░]  len=230/512 (55% pad)│
+│  Sequence 3: [████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░]  len=128/512 (75% pad)│
+│  Sequence 4: [██████████████████████████████████████████]  len=512/512 (0% pad) │
+│                                                                                │
+│  Total tokens: 50 + 230 + 128 + 512 = 920 real tokens                         │
+│  Total compute: 4 × 512 = 2048 positions                                      │
+│  Wasted compute: 55%!                                                          │
+│                                                                                │
+│  SOLUTIONS:                                                                    │
+│  ──────────                                                                    │
+│                                                                                │
+│  1. Dynamic Padding: Pad to longest in batch, not global max                  │
+│  2. Bucketing: Group similar-length sequences together                        │
+│  3. Packing: Concatenate sequences, no padding at all                         │
+│  4. Flash Attention: Variable-length attention (no padding needed)            │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Storage Strategy 1: Raw Text (UTF-8)
+
+The simplest approach: store raw text, tokenize at load time.
 
 ```python
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Type
+import struct
 
 class RawTextField:
     """
     Store text as raw UTF-8 bytes.
     
+    This provides maximum flexibility: you can change tokenizers
+    without re-creating the dataset.
+    
     Use when:
-    - Tokenizer may change during training
-    - Multiple tokenizers needed
-    - Storage space is abundant
+    - Experimenting with different tokenizers
+    - Storage is not a concern
+    - Dataset is small enough that tokenization overhead is acceptable
     """
     
-    type_id = 20
+    TYPE_ID = 40
     
     def __init__(
         self,
-        max_length: int = 10000,  # Max chars
-        encoding: str = 'utf-8'
+        max_chars: int = 100000,
+        encoding: str = 'utf-8',
     ):
-        self.max_length = max_length
+        """
+        Args:
+            max_chars: Maximum characters to store (truncate longer texts).
+            encoding: Text encoding (utf-8 recommended).
+        """
+        self.max_chars = max_chars
         self.encoding = encoding
     
     @property
     def metadata_type(self) -> np.dtype:
         return np.dtype([
-            ('data_ptr', '<u8'),
-            ('byte_length', '<u4'),
-            ('char_length', '<u4'),  # Unicode chars (may differ from bytes)
+            ('data_ptr', '<u8'),       # Pointer to text bytes
+            ('byte_length', '<u4'),    # Length in bytes
+            ('char_length', '<u4'),    # Length in characters (may differ from bytes for UTF-8)
         ], align=True)
     
     def encode(self, text: str) -> Tuple[np.ndarray, bytes]:
-        """Encode text to bytes."""
+        """
+        Encode text to bytes.
+        
+        Args:
+            text: Input string.
+        
+        Returns:
+            (metadata, text_bytes)
+        """
         # Truncate if needed
-        if len(text) > self.max_length:
-            text = text[:self.max_length]
+        if len(text) > self.max_chars:
+            text = text[:self.max_chars]
         
         # Encode to bytes
         text_bytes = text.encode(self.encoding)
         
-        # Metadata
+        # Create metadata
         metadata = np.zeros(1, dtype=self.metadata_type)[0]
+        metadata['data_ptr'] = 0  # Filled by writer
         metadata['byte_length'] = len(text_bytes)
         metadata['char_length'] = len(text)
         
         return metadata, text_bytes
     
-    def decode(self, metadata, read_fn) -> str:
-        """Decode bytes to text."""
-        ptr = metadata['data_ptr']
-        size = metadata['byte_length']
-        
-        raw_bytes = read_fn(ptr, size)
-        return bytes(raw_bytes).decode(self.encoding)
+    def to_binary(self) -> bytes:
+        return struct.pack('<I', self.max_chars)
+    
+    @classmethod
+    def from_binary(cls, data: bytes) -> 'RawTextField':
+        max_chars, = struct.unpack('<I', data[:4])
+        return cls(max_chars=max_chars)
+    
+    def get_decoder_class(self) -> Type:
+        return RawTextDecoder
 
 
 class RawTextDecoder:
-    """Decoder with on-the-fly tokenization."""
+    """
+    Decoder for raw text with optional tokenization.
+    """
     
-    def __init__(self, tokenizer):
+    def __init__(self, field: RawTextField, metadata: np.ndarray, memory_read, tokenizer=None):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
         self.tokenizer = tokenizer
     
-    def decode(self, metadata, read_fn):
-        ptr = metadata['data_ptr']
-        size = metadata['byte_length']
+    def decode_text(self, sample_id: int) -> str:
+        """Decode to raw string."""
+        ptr = self.metadata[sample_id]['data_ptr']
+        byte_length = self.metadata[sample_id]['byte_length']
         
-        raw_bytes = read_fn(ptr, size)
-        text = bytes(raw_bytes).decode('utf-8')
+        raw_bytes = self.memory_read(ptr, None)[:byte_length]
+        return bytes(raw_bytes).decode('utf-8')
+    
+    def decode_tokenized(self, sample_id: int, max_length: int = 512) -> dict:
+        """Decode and tokenize."""
+        text = self.decode_text(sample_id)
         
-        # Tokenize
-        return self.tokenizer(text, return_tensors='np')
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer required for decode_tokenized")
+        
+        return self.tokenizer(
+            text,
+            truncation=True,
+            max_length=max_length,
+            padding=False,  # Don't pad yet
+            return_tensors='np',
+        )
+    
+    def generate_code(self):
+        """Generate batch decode function."""
+        metadata = self.metadata
+        mem_read = self.memory_read
+        
+        def decode(batch_indices, destination, metadata_arg, storage_state):
+            texts = []
+            for batch_idx in range(len(batch_indices)):
+                sample_id = batch_indices[batch_idx]
+                
+                ptr = metadata[sample_id]['data_ptr']
+                byte_length = metadata[sample_id]['byte_length']
+                
+                raw_bytes = mem_read(ptr, storage_state)[:byte_length]
+                text = bytes(raw_bytes).decode('utf-8')
+                texts.append(text)
+            
+            return texts  # Returns list of strings
+        
+        return decode
 ```
 
-### Strategy 2: Pre-Tokenized Sequences
+## Storage Strategy 2: Pre-Tokenized Sequences
 
-Store token IDs directly for maximum speed:
+Store token IDs directly for maximum loading speed.
 
 ```python
 class TokenizedTextField:
     """
     Store pre-tokenized text as token IDs.
     
-    Use when:
-    - Tokenizer is fixed
-    - Maximum loading speed needed
-    - Token IDs fit in int32 (vocab < 2B)
+    This is the most common approach for large-scale training.
+    Tokenization is done once during dataset creation.
+    
+    Token ID dtype selection:
+    - uint8:  vocab < 256 (rare, only character-level)
+    - uint16: vocab < 65536 (most BPE tokenizers)
+    - int32:  vocab < 2B (very large vocabularies)
     """
     
-    type_id = 21
+    TYPE_ID = 41
     
     def __init__(
         self,
-        max_tokens: int = 512,
-        vocab_size: int = 50000,
-        tokenizer = None,
-        store_special_tokens: bool = True
+        tokenizer,
+        max_tokens: int = 2048,
+        add_special_tokens: bool = True,
     ):
-        self.max_tokens = max_tokens
-        self.vocab_size = vocab_size
+        """
+        Args:
+            tokenizer: HuggingFace tokenizer (or compatible).
+            max_tokens: Maximum tokens to store per sample.
+            add_special_tokens: Whether to include [CLS], [SEP], etc.
+        """
         self.tokenizer = tokenizer
-        self.store_special_tokens = store_special_tokens
+        self.max_tokens = max_tokens
+        self.add_special_tokens = add_special_tokens
         
-        # Determine dtype based on vocab size
+        # Determine optimal dtype
+        vocab_size = tokenizer.vocab_size
         if vocab_size <= 256:
             self.token_dtype = np.uint8
         elif vocab_size <= 65536:
             self.token_dtype = np.uint16
         else:
             self.token_dtype = np.int32
+        
+        self.bytes_per_token = np.dtype(self.token_dtype).itemsize
     
     @property
     def metadata_type(self) -> np.dtype:
         return np.dtype([
             ('data_ptr', '<u8'),
-            ('num_tokens', '<u2'),
-            ('pad_token_id', '<u2'),
+            ('num_tokens', '<u4'),
         ], align=True)
     
     def encode(self, text: str) -> Tuple[np.ndarray, bytes]:
-        """Tokenize and encode."""
+        """
+        Tokenize and encode text.
+        """
         # Tokenize
-        tokens = self.tokenizer(
+        encoding = self.tokenizer(
             text,
             truncation=True,
             max_length=self.max_tokens,
-            add_special_tokens=self.store_special_tokens
-        )['input_ids']
+            add_special_tokens=self.add_special_tokens,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        
+        token_ids = encoding['input_ids']
         
         # Convert to numpy
-        token_array = np.array(tokens, dtype=self.token_dtype)
+        tokens = np.array(token_ids, dtype=self.token_dtype)
         
-        # Metadata
+        # Create metadata
         metadata = np.zeros(1, dtype=self.metadata_type)[0]
+        metadata['data_ptr'] = 0
         metadata['num_tokens'] = len(tokens)
-        metadata['pad_token_id'] = self.tokenizer.pad_token_id or 0
         
-        return metadata, token_array.tobytes()
+        return metadata, tokens.tobytes()
     
-    def decode(self, metadata, read_fn) -> np.ndarray:
-        """Load token IDs."""
-        ptr = metadata['data_ptr']
-        num_tokens = metadata['num_tokens']
+    def to_binary(self) -> bytes:
+        # Store tokenizer name and config for verification
+        tokenizer_name = getattr(self.tokenizer, 'name_or_path', 'unknown')
+        name_bytes = tokenizer_name.encode('utf-8')[:128].ljust(128, b'\x00')
         
-        raw_bytes = read_fn(ptr, num_tokens * np.dtype(self.token_dtype).itemsize)
-        tokens = np.frombuffer(raw_bytes, dtype=self.token_dtype)
+        return struct.pack('<I', self.max_tokens) + \
+               struct.pack('<I', self.tokenizer.vocab_size) + \
+               struct.pack('<B', self.bytes_per_token) + \
+               name_bytes
+    
+    @classmethod
+    def from_binary(cls, data: bytes, tokenizer) -> 'TokenizedTextField':
+        max_tokens, vocab_size, bytes_per_token = struct.unpack('<IIB', data[:9])
+        name = data[9:137].rstrip(b'\x00').decode('utf-8')
         
-        return tokens
+        # Verify tokenizer compatibility
+        if tokenizer.vocab_size != vocab_size:
+            raise ValueError(
+                f"Tokenizer vocab size mismatch: "
+                f"file has {vocab_size}, provided tokenizer has {tokenizer.vocab_size}"
+            )
+        
+        return cls(tokenizer=tokenizer, max_tokens=max_tokens)
+    
+    def get_decoder_class(self) -> Type:
+        return TokenizedTextDecoder
 
 
 class TokenizedTextDecoder:
-    """Decoder with optional padding."""
+    """
+    Decoder for pre-tokenized text.
+    """
     
-    def __init__(
-        self,
-        max_length: int,
-        token_dtype: np.dtype,
-        pad_token_id: int = 0
-    ):
-        self.max_length = max_length
-        self.token_dtype = token_dtype
-        self.pad_token_id = pad_token_id
+    def __init__(self, field: TokenizedTextField, metadata: np.ndarray, memory_read):
+        self.field = field
+        self.metadata = metadata
+        self.memory_read = memory_read
+        
+        self.max_tokens = int(metadata['num_tokens'].max())
+        self.token_dtype = field.token_dtype
+        self.bytes_per_token = field.bytes_per_token
     
-    def decode(self, metadata, read_fn) -> dict:
-        """Decode to dict with input_ids and attention_mask."""
-        ptr = metadata['data_ptr']
-        num_tokens = metadata['num_tokens']
+    def declare_state_and_memory(self, previous_state):
+        from dataclasses import dataclass
         
-        # Read tokens
-        raw_bytes = read_fn(ptr, num_tokens * np.dtype(self.token_dtype).itemsize)
-        tokens = np.frombuffer(raw_bytes, dtype=self.token_dtype)
+        @dataclass
+        class State:
+            shape: tuple
+            dtype: np.dtype
+            jit_mode: bool
         
-        # Pad to max length
-        input_ids = np.full(self.max_length, self.pad_token_id, dtype=np.int64)
-        input_ids[:num_tokens] = tokens
+        @dataclass
+        class AllocationQuery:
+            shape: tuple
+            dtype: np.dtype
         
-        # Create attention mask
-        attention_mask = np.zeros(self.max_length, dtype=np.int64)
-        attention_mask[:num_tokens] = 1
+        # Output: fixed-length padded sequence
+        new_state = State(
+            shape=(self.max_tokens,),
+            dtype=np.int64,  # Standard for PyTorch
+            jit_mode=True,
+        )
+        allocation = AllocationQuery(
+            shape=(self.max_tokens,),
+            dtype=np.int64,
+        )
+        return new_state, allocation
+    
+    def generate_code(self):
+        metadata = self.metadata
+        mem_read = self.memory_read
+        token_dtype = self.token_dtype
+        bytes_per_token = self.bytes_per_token
+        pad_token_id = self.field.tokenizer.pad_token_id or 0
         
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'length': num_tokens
-        }
+        import numba as nb
+        
+        @nb.njit(parallel=True, nogil=True)
+        def _pad_tokens(tokens, output, pad_id):
+            """Pad/copy tokens to output."""
+            n = min(len(tokens), len(output))
+            for i in nb.prange(n):
+                output[i] = tokens[i]
+            for i in nb.prange(n, len(output)):
+                output[i] = pad_id
+        
+        def decode(batch_indices, destination, metadata_arg, storage_state):
+            """
+            Decode batch of tokenized sequences.
+            
+            Returns:
+                destination: (batch, max_tokens) int64 array
+            """
+            for batch_idx in range(len(batch_indices)):
+                sample_id = batch_indices[batch_idx]
+                
+                ptr = metadata[sample_id]['data_ptr']
+                num_tokens = metadata[sample_id]['num_tokens']
+                
+                # Read token bytes
+                byte_size = num_tokens * bytes_per_token
+                raw_bytes = mem_read(ptr, storage_state)[:byte_size]
+                
+                # View as token array
+                tokens = np.frombuffer(raw_bytes, dtype=token_dtype)
+                
+                # Pad to max length
+                _pad_tokens(tokens, destination[batch_idx], pad_token_id)
+            
+            return destination[:len(batch_indices)]
+        
+        decode.is_parallel = True
+        return decode
 ```
 
-### Strategy 3: Packed Sequences (No Padding)
+## Storage Strategy 3: Packed Sequences
 
-Eliminate padding waste:
+Eliminate padding waste entirely by concatenating sequences.
 
 ```python
-class PackedTextField:
+class PackedTokenField:
     """
-    Store sequences packed together without padding.
+    Store tokens in packed format (no padding between sequences).
     
     Format:
-    ┌─────────────────────────────────────────────┐
-    │ Sequence 1 tokens │ Sequence 2 tokens │ ... │
-    └─────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ Sequence Index Table                                            │
+    │ ├─ cumulative_offset[0]: uint64                                 │
+    │ ├─ cumulative_offset[1]: uint64                                 │
+    │ └─ ...                                                          │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ Packed Tokens                                                   │
+    │ [seq0_tokens][seq1_tokens][seq2_tokens]...                      │
+    └─────────────────────────────────────────────────────────────────┘
     
-    Metadata stores (start_idx, length) for each sequence.
+    This is ideal for language model pre-training where sequences
+    can be arbitrarily concatenated.
     
     Benefits:
-    - No padding waste
-    - ~30% storage reduction typical
-    - Perfect for language modeling
+    - Zero padding waste
+    - Efficient storage
+    - Natural for causal LM training
+    
+    Works with:
+    - Flash Attention (native variable-length support)
+    - Sequence packing in transformers
     """
     
-    type_id = 22
+    TYPE_ID = 42
     
     def __init__(
         self,
         tokenizer,
-        chunk_size: int = 4096,  # Tokens per chunk
-        overlap: int = 0
+        chunk_tokens: int = 4096,
+        add_eos_between_docs: bool = True,
     ):
         self.tokenizer = tokenizer
-        self.chunk_size = chunk_size
-        self.overlap = overlap
+        self.chunk_tokens = chunk_tokens
+        self.add_eos_between_docs = add_eos_between_docs
+        
+        self.eos_token_id = tokenizer.eos_token_id
+        
+        if tokenizer.vocab_size <= 65536:
+            self.token_dtype = np.uint16
+        else:
+            self.token_dtype = np.int32
     
     @property
     def metadata_type(self) -> np.dtype:
-        return np.dtype([
-            ('chunk_ptr', '<u8'),      # Pointer to token chunk
-            ('local_start', '<u4'),    # Start within chunk
-            ('length', '<u4'),         # Sequence length
-            ('doc_id', '<u4'),         # Document ID
-        ], align=True)
-    
-    def encode_document(self, text: str, doc_id: int) -> Tuple[list, bytes]:
-        """Encode a document, possibly split into chunks."""
-        # Tokenize entire document
-        tokens = self.tokenizer(text)['input_ids']
-        token_array = np.array(tokens, dtype=np.int32)
-        
-        # Split into chunks
-        chunks = []
-        metadata_list = []
-        
-        for start in range(0, len(tokens), self.chunk_size - self.overlap):
-            end = min(start + self.chunk_size, len(tokens))
-            chunk_tokens = token_array[start:end]
-            
-            meta = np.zeros(1, dtype=self.metadata_type)[0]
-            meta['local_start'] = 0  # Will be updated by writer
-            meta['length'] = len(chunk_tokens)
-            meta['doc_id'] = doc_id
-            
-            chunks.append(chunk_tokens.tobytes())
-            metadata_list.append(meta)
-        
-        return metadata_list, chunks
-
-
-class PackedSequenceLoader:
-    """
-    Loader that creates packed batches.
-    
-    Instead of padding, concatenates sequences
-    and uses position IDs to track boundaries.
-    """
-    
-    def __init__(
-        self,
-        reader,
-        batch_tokens: int = 4096,  # Tokens per batch
-        shuffle: bool = True
-    ):
-        self.reader = reader
-        self.batch_tokens = batch_tokens
-        self.shuffle = shuffle
-    
-    def __iter__(self):
-        """Generate packed batches."""
-        # Get all sequence lengths
-        lengths = self.reader.metadata['length']
-        indices = np.arange(len(lengths))
-        
-        if self.shuffle:
-            np.random.shuffle(indices)
-        
-        # Pack sequences into batches
-        batch_tokens = []
-        batch_positions = []
-        batch_doc_ids = []
-        current_pos = 0
-        
-        for idx in indices:
-            meta = self.reader.metadata[idx]
-            length = meta['length']
-            
-            # Would this overflow the batch?
-            if current_pos + length > self.batch_tokens:
-                # Yield current batch
-                yield self._finalize_batch(
-                    batch_tokens, batch_positions, batch_doc_ids
-                )
-                # Start new batch
-                batch_tokens = []
-                batch_positions = []
-                batch_doc_ids = []
-                current_pos = 0
-            
-            # Load tokens
-            tokens = self._load_tokens(idx)
-            batch_tokens.append(tokens)
-            batch_positions.append(np.arange(length))
-            batch_doc_ids.append(np.full(length, meta['doc_id']))
-            current_pos += length
-        
-        # Yield final batch
-        if batch_tokens:
-            yield self._finalize_batch(
-                batch_tokens, batch_positions, batch_doc_ids
-            )
-    
-    def _finalize_batch(self, tokens, positions, doc_ids):
-        return {
-            'input_ids': np.concatenate(tokens),
-            'position_ids': np.concatenate(positions),
-            'document_ids': np.concatenate(doc_ids),
-            'num_sequences': len(tokens)
-        }
-    
-    def _load_tokens(self, idx):
-        meta = self.reader.metadata[idx]
-        return self.reader.read_tokens(meta)
-```
-
-### Strategy 4: Hierarchical Text (Documents > Paragraphs > Sentences)
-
-For document-level tasks:
-
-```python
-class HierarchicalTextField:
-    """
-    Store text with hierarchical structure.
-    
-    Format:
-    ┌─────────────────────────────────────────────┐
-    │ Document Header                             │
-    │ ├─ num_paragraphs                          │
-    │ ├─ paragraph_offsets[]                     │
-    │ └─ paragraph_lengths[]                     │
-    ├─────────────────────────────────────────────┤
-    │ Paragraph 0 (tokenized)                    │
-    ├─────────────────────────────────────────────┤
-    │ Paragraph 1 (tokenized)                    │
-    ├─────────────────────────────────────────────┤
-    │ ...                                         │
-    └─────────────────────────────────────────────┘
-    
-    Use for:
-    - Document summarization
-    - Question answering over documents
-    - Hierarchical attention models
-    """
-    
-    type_id = 23
-    
-    def __init__(
-        self,
-        tokenizer,
-        max_paragraphs: int = 100,
-        max_tokens_per_paragraph: int = 512
-    ):
-        self.tokenizer = tokenizer
-        self.max_paragraphs = max_paragraphs
-        self.max_tokens_per_para = max_tokens_per_paragraph
-    
-    @property
-    def metadata_type(self) -> np.dtype:
+        """Per-document metadata."""
         return np.dtype([
             ('doc_id', '<u4'),
-            ('num_paragraphs', '<u2'),
-            ('total_tokens', '<u4'),
-            ('header_ptr', '<u8'),
-            ('data_ptr', '<u8'),
-            ('data_size', '<u4'),
+            ('start_offset', '<u8'),   # Position in global token stream
+            ('num_tokens', '<u4'),
         ], align=True)
     
-    def encode(self, text: str, doc_id: int) -> Tuple[np.ndarray, bytes]:
-        """Encode hierarchical document."""
-        # Split into paragraphs
-        paragraphs = text.split('\n\n')
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-        paragraphs = paragraphs[:self.max_paragraphs]
+    def create_packed_dataset(self, documents, output_path: str):
+        """
+        Pack all documents into a single token stream.
         
-        # Tokenize each paragraph
-        para_tokens = []
-        for para in paragraphs:
-            tokens = self.tokenizer(
-                para,
-                truncation=True,
-                max_length=self.max_tokens_per_para
-            )['input_ids']
-            para_tokens.append(np.array(tokens, dtype=np.int32))
+        Args:
+            documents: Iterator of (doc_id, text) tuples.
+            output_path: Path to output file.
+        """
+        import mmap
         
-        # Build offset table
-        offsets = np.zeros(len(paragraphs), dtype='<u4')
-        lengths = np.zeros(len(paragraphs), dtype='<u2')
+        all_tokens = []
+        metadata_list = []
+        current_offset = 0
         
-        offset = 0
-        for i, tokens in enumerate(para_tokens):
-            offsets[i] = offset
-            lengths[i] = len(tokens)
-            offset += len(tokens) * 4  # int32
+        for doc_id, text in documents:
+            # Tokenize
+            tokens = self.tokenizer.encode(text, add_special_tokens=True)
+            
+            if self.add_eos_between_docs and self.eos_token_id is not None:
+                tokens = tokens + [self.eos_token_id]
+            
+            # Record metadata
+            meta = np.zeros(1, dtype=self.metadata_type)[0]
+            meta['doc_id'] = doc_id
+            meta['start_offset'] = current_offset
+            meta['num_tokens'] = len(tokens)
+            metadata_list.append(meta)
+            
+            # Accumulate tokens
+            all_tokens.extend(tokens)
+            current_offset += len(tokens)
         
-        # Pack header: num_paragraphs, offsets, lengths
-        header = np.array([len(paragraphs)], dtype='<u2')
-        header_bytes = header.tobytes() + offsets.tobytes() + lengths.tobytes()
+        # Convert to numpy
+        token_array = np.array(all_tokens, dtype=self.token_dtype)
+        metadata_array = np.array(metadata_list)
         
-        # Pack token data
-        token_bytes = b''.join(t.tobytes() for t in para_tokens)
+        # Write to file
+        # (In practice, use a proper writer class)
+        with open(output_path, 'wb') as f:
+            # Header: total tokens, num docs
+            f.write(struct.pack('<QQ', len(token_array), len(metadata_array)))
+            
+            # Metadata table
+            f.write(metadata_array.tobytes())
+            
+            # Token data
+            f.write(token_array.tobytes())
         
-        # Combine
-        all_data = header_bytes + token_bytes
-        
-        # Metadata
-        metadata = np.zeros(1, dtype=self.metadata_type)[0]
-        metadata['doc_id'] = doc_id
-        metadata['num_paragraphs'] = len(paragraphs)
-        metadata['total_tokens'] = sum(len(t) for t in para_tokens)
-        metadata['data_size'] = len(all_data)
-        
-        return metadata, all_data
+        return len(token_array), len(metadata_array)
+
+
+class PackedTokenLoader:
+    """
+    Loader that creates fixed-size chunks from packed tokens.
     
-    def decode(self, metadata, read_fn) -> dict:
-        """Decode hierarchical document."""
-        data = read_fn(metadata['data_ptr'], metadata['data_size'])
+    For each batch, we:
+    1. Extract a chunk of chunk_tokens consecutive tokens
+    2. Create position IDs and document boundaries
+    3. Return the batch
+    """
+    
+    def __init__(
+        self,
+        packed_file: str,
+        chunk_tokens: int = 4096,
+        batch_size: int = 8,
+        shuffle: bool = True,
+    ):
+        self.chunk_tokens = chunk_tokens
+        self.batch_size = batch_size
+        self.shuffle = shuffle
         
-        # Parse header
-        num_paras = np.frombuffer(data[:2], dtype='<u2')[0]
-        header_size = 2 + num_paras * 4 + num_paras * 2
+        # Memory-map the token file
+        import mmap as mmap_module
         
-        offsets = np.frombuffer(data[2:2 + num_paras * 4], dtype='<u4')
-        lengths = np.frombuffer(data[2 + num_paras * 4:header_size], dtype='<u2')
+        self.file = open(packed_file, 'rb')
+        self.mm = mmap_module.mmap(self.file.fileno(), 0, access=mmap_module.ACCESS_READ)
         
-        # Parse paragraphs
-        token_data = data[header_size:]
-        paragraphs = []
+        # Read header
+        self.total_tokens, self.num_docs = struct.unpack('<QQ', self.mm[:16])
         
-        for i in range(num_paras):
-            start = offsets[i]
-            length = lengths[i]
-            tokens = np.frombuffer(
-                token_data[start:start + length * 4],
-                dtype=np.int32
-            )
-            paragraphs.append(tokens)
+        # Read metadata
+        metadata_size = self.num_docs * np.dtype([
+            ('doc_id', '<u4'),
+            ('start_offset', '<u8'),
+            ('num_tokens', '<u4'),
+        ]).itemsize
         
-        return {
-            'paragraphs': paragraphs,
-            'num_paragraphs': num_paras,
-            'paragraph_lengths': lengths
-        }
+        self.metadata = np.frombuffer(
+            self.mm[16:16 + metadata_size],
+            dtype=np.dtype([
+                ('doc_id', '<u4'),
+                ('start_offset', '<u8'),
+                ('num_tokens', '<u4'),
+            ])
+        )
+        
+        self.tokens_offset = 16 + metadata_size
+        
+        # Total chunks
+        self.num_chunks = self.total_tokens // chunk_tokens
+    
+    def __len__(self):
+        return self.num_chunks // self.batch_size
+    
+    def __iter__(self):
+        # Generate chunk indices
+        chunk_indices = np.arange(self.num_chunks)
+        
+        if self.shuffle:
+            np.random.shuffle(chunk_indices)
+        
+        for batch_start in range(0, len(chunk_indices) - self.batch_size + 1, self.batch_size):
+            batch_chunk_ids = chunk_indices[batch_start:batch_start + self.batch_size]
+            
+            # Build batch
+            input_ids = np.zeros((self.batch_size, self.chunk_tokens), dtype=np.int64)
+            
+            for i, chunk_id in enumerate(batch_chunk_ids):
+                # Calculate byte offset
+                token_start = chunk_id * self.chunk_tokens
+                byte_start = self.tokens_offset + token_start * 2  # uint16
+                byte_end = byte_start + self.chunk_tokens * 2
+                
+                # Read tokens
+                tokens = np.frombuffer(
+                    self.mm[byte_start:byte_end],
+                    dtype=np.uint16
+                )
+                input_ids[i] = tokens
+            
+            yield {
+                'input_ids': input_ids,
+                'labels': input_ids.copy(),  # For causal LM
+            }
+    
+    def close(self):
+        self.mm.close()
+        self.file.close()
+```
+
+## Storage Strategy 4: Bucketed Sequences
+
+Group sequences by length to minimize padding within each batch.
+
+```python
+class BucketedTokenField:
+    """
+    Store sequences organized by length buckets.
+    
+    This enables mining batches with similar-length sequences,
+    minimizing padding waste while still allowing dynamic batching.
+    
+    Bucket structure:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ Bucket 0 (len 1-64)                                             │
+    │ ├─ Sequence offsets table                                       │
+    │ └─ Sequence data                                                │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ Bucket 1 (len 65-128)                                           │
+    │ ├─ Sequence offsets table                                       │
+    │ └─ Sequence data                                                │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ ...                                                             │
+    └─────────────────────────────────────────────────────────────────┘
+    """
+    
+    TYPE_ID = 43
+    
+    def __init__(
+        self,
+        tokenizer,
+        bucket_boundaries: list = [64, 128, 256, 512, 1024, 2048],
+        max_tokens: int = 4096,
+    ):
+        self.tokenizer = tokenizer
+        self.bucket_boundaries = sorted(bucket_boundaries)
+        self.max_tokens = max_tokens
+        
+        # Add final bucket for sequences up to max_tokens
+        if self.bucket_boundaries[-1] < max_tokens:
+            self.bucket_boundaries.append(max_tokens)
+    
+    def get_bucket_id(self, length: int) -> int:
+        """Determine which bucket a sequence belongs to."""
+        for i, boundary in enumerate(self.bucket_boundaries):
+            if length <= boundary:
+                return i
+        return len(self.bucket_boundaries) - 1
+    
+    # ... (implementation similar to PackedTokenField but organized by bucket)
+
+
+class BucketedLoader:
+    """
+    Loader that samples batches from length buckets.
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        drop_last: bool = True,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        
+        # Group sample indices by bucket
+        self.buckets = self._build_buckets()
+    
+    def _build_buckets(self):
+        """Group samples by length bucket."""
+        buckets = {i: [] for i in range(len(self.dataset.bucket_boundaries))}
+        
+        for idx in range(len(self.dataset.metadata)):
+            length = self.dataset.metadata[idx]['num_tokens']
+            bucket_id = self.dataset.get_bucket_id(length)
+            buckets[bucket_id].append(idx)
+        
+        return buckets
+    
+    def __iter__(self):
+        # Shuffle within each bucket
+        shuffled_buckets = {}
+        for bucket_id, indices in self.buckets.items():
+            shuffled = np.array(indices)
+            np.random.shuffle(shuffled)
+            shuffled_buckets[bucket_id] = shuffled
+        
+        # Generate batches from each bucket
+        for bucket_id in shuffled_buckets:
+            indices = shuffled_buckets[bucket_id]
+            
+            for start in range(0, len(indices) - self.batch_size + 1, self.batch_size):
+                batch_indices = indices[start:start + self.batch_size]
+                
+                # Load and pad to bucket max length
+                # (padding is minimal since all sequences are similar length)
+                yield self._load_batch(batch_indices, bucket_id)
 ```
 
 ## JIT-Compiled Text Operations
 
 ```python
 import numba as nb
+import numpy as np
 
 @nb.njit
-def pad_sequence(
-    tokens: np.ndarray,
-    max_length: int,
-    pad_value: int
-) -> np.ndarray:
-    """Pad or truncate sequence to fixed length."""
-    result = np.full(max_length, pad_value, dtype=tokens.dtype)
+def pad_sequence(tokens: np.ndarray, max_length: int, pad_value: int) -> np.ndarray:
+    """Pad a single sequence to max_length."""
+    result = np.full(max_length, pad_value, dtype=np.int64)
     length = min(len(tokens), max_length)
     result[:length] = tokens[:length]
     return result
 
 
-@nb.njit
-def create_attention_mask(
-    length: int,
-    max_length: int
-) -> np.ndarray:
-    """Create attention mask."""
-    mask = np.zeros(max_length, dtype=np.int64)
-    mask[:length] = 1
-    return mask
-
-
-@nb.njit
-def create_causal_mask(length: int) -> np.ndarray:
-    """Create causal (autoregressive) attention mask."""
-    mask = np.tril(np.ones((length, length), dtype=np.float32))
-    return mask
-
-
-@nb.njit(parallel=True)
+@nb.njit(parallel=True, nogil=True)
 def batch_pad_sequences(
-    sequences: list,
-    max_length: int,
-    pad_value: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Pad batch of sequences."""
-    batch_size = len(sequences)
+    token_ptrs: np.ndarray,    # (batch,) pointers to token arrays
+    token_lengths: np.ndarray, # (batch,) lengths
+    output: np.ndarray,        # (batch, max_len) output buffer
+    pad_value: int,
+):
+    """Pad a batch of sequences in parallel."""
+    batch_size, max_len = output.shape
     
-    input_ids = np.full((batch_size, max_length), pad_value, dtype=np.int64)
-    attention_mask = np.zeros((batch_size, max_length), dtype=np.int64)
+    # Initialize with pad value
+    for b in nb.prange(batch_size):
+        for i in range(max_len):
+            output[b, i] = pad_value
     
-    for i in nb.prange(batch_size):
-        seq = sequences[i]
-        length = min(len(seq), max_length)
-        input_ids[i, :length] = seq[:length]
-        attention_mask[i, :length] = 1
+    # Copy tokens
+    for b in nb.prange(batch_size):
+        length = min(token_lengths[b], max_len)
+        for i in range(length):
+            output[b, i] = token_ptrs[b, i]  # Simplified; actual impl needs mem access
     
-    return input_ids, attention_mask
+    return output
+
+
+@nb.njit
+def create_attention_mask(length: int, max_length: int) -> np.ndarray:
+    """Create a simple attention mask (1 for tokens, 0 for padding)."""
+    mask = np.zeros(max_length, dtype=np.int64)
+    mask[:min(length, max_length)] = 1
+    return mask
+
+
+@nb.njit
+def create_causal_mask(seq_length: int) -> np.ndarray:
+    """
+    Create a causal (lower-triangular) attention mask.
+    
+    Used for autoregressive models like GPT.
+    """
+    # Upper triangle is -inf (masked), lower triangle is 0 (attend)
+    # For additive masking: softmax(QK^T + mask)
+    mask = np.zeros((seq_length, seq_length), dtype=np.float32)
+    for i in range(seq_length):
+        for j in range(i + 1, seq_length):
+            mask[i, j] = -np.inf
+    return mask
+
+
+@nb.njit
+def find_document_boundaries(input_ids: np.ndarray, eos_token: int) -> np.ndarray:
+    """
+    Find document boundaries in a packed sequence.
+    
+    Returns array of (start, end) positions for each document.
+    """
+    boundaries = []
+    start = 0
+    
+    for i in range(len(input_ids)):
+        if input_ids[i] == eos_token:
+            boundaries.append((start, i + 1))
+            start = i + 1
+    
+    # Last document (if not ending with EOS)
+    if start < len(input_ids):
+        boundaries.append((start, len(input_ids)))
+    
+    return np.array(boundaries, dtype=np.int64)
 ```
 
-## Text Collation Strategies
+## Performance Comparison
 
-```python
-class TextCollator:
-    """
-    Collates text samples into batches.
-    Supports multiple padding strategies.
-    """
-    
-    def __init__(
-        self,
-        max_length: int = 512,
-        padding: str = 'max_length',  # 'max_length', 'longest', 'none'
-        pad_token_id: int = 0,
-        return_tensors: str = 'np'  # 'np', 'pt'
-    ):
-        self.max_length = max_length
-        self.padding = padding
-        self.pad_token_id = pad_token_id
-        self.return_tensors = return_tensors
-    
-    def __call__(self, samples: list) -> dict:
-        """Collate samples into batch."""
-        
-        if self.padding == 'none':
-            # Return packed format
-            return self._pack_sequences(samples)
-        
-        elif self.padding == 'longest':
-            # Pad to longest in batch
-            max_len = min(
-                max(len(s['input_ids']) for s in samples),
-                self.max_length
-            )
-            return self._pad_to_length(samples, max_len)
-        
-        else:  # max_length
-            return self._pad_to_length(samples, self.max_length)
-    
-    def _pad_to_length(self, samples, length):
-        batch_size = len(samples)
-        
-        input_ids = np.full(
-            (batch_size, length),
-            self.pad_token_id,
-            dtype=np.int64
-        )
-        attention_mask = np.zeros((batch_size, length), dtype=np.int64)
-        
-        for i, sample in enumerate(samples):
-            seq_len = min(len(sample['input_ids']), length)
-            input_ids[i, :seq_len] = sample['input_ids'][:seq_len]
-            attention_mask[i, :seq_len] = 1
-        
-        result = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
-        }
-        
-        if self.return_tensors == 'pt':
-            import torch
-            result = {k: torch.from_numpy(v) for k, v in result.items()}
-        
-        return result
-    
-    def _pack_sequences(self, samples):
-        # Concatenate all sequences
-        all_ids = np.concatenate([s['input_ids'] for s in samples])
-        
-        # Create position IDs that reset per sequence
-        positions = []
-        for s in samples:
-            positions.append(np.arange(len(s['input_ids'])))
-        all_positions = np.concatenate(positions)
-        
-        return {
-            'input_ids': all_ids,
-            'position_ids': all_positions,
-            'sequence_lengths': [len(s['input_ids']) for s in samples]
-        }
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      TEXT FIELD PERFORMANCE COMPARISON                         │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  Strategy              Storage        Load Time       Best Use Case            │
+│  ────────              ───────        ─────────       ─────────────            │
+│                                                                                │
+│  Raw UTF-8             1.0x           10-50 ms        Experimentation          │
+│  (tokenize at load)    (baseline)     (tokenization)  Multiple tokenizers      │
+│                                                                                │
+│  Pre-tokenized         0.5-0.8x       0.1-1 ms        Large-scale training     │
+│  (uint16 tokens)       (smaller)      (memcpy)        Fixed tokenizer          │
+│                                                                                │
+│  Packed                0.4-0.6x       0.1-1 ms        Language modeling        │
+│  (no padding)          (smallest)     (memcpy)        Flash Attention          │
+│                                                                                │
+│  Bucketed              0.5-0.8x       0.2-2 ms        Variable-length tasks    │
+│                        (depends)      (+ binning)     Minimal padding          │
+│                                                                                │
+│                                                                                │
+│  THROUGHPUT (samples/sec, single thread):                                      │
+│                                                                                │
+│  Raw UTF-8:            1,000-10,000   (bottleneck: tokenization)               │
+│  Pre-tokenized:        100,000+       (bottleneck: I/O)                        │
+│  Packed:               500,000+       (bottleneck: I/O, no per-sample overhead)│
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Performance Summary
+## Exercises
 
-| Strategy | Storage | Load Speed | Flexibility |
-|----------|---------|------------|-------------|
-| Raw UTF-8 | Large | Slow (tokenize) | High |
-| Pre-tokenized | Small | Fast | Low (fixed tokenizer) |
-| Packed | Smallest | Fast | Medium |
-| Hierarchical | Medium | Medium | High (structure) |
+1.  **Implement SentencePiece Integration**: Create a `SentencePieceTextField` that uses SentencePiece for tokenization during encoding.
 
-## Next Steps
+2.  **Token Caching**: Build a caching layer that stores recently-used sequences in RAM to avoid re-reading from disk.
 
-- See [02_text_augmentations.md](02_text_augmentations.md) for text augmentations
-- See [../multimodal/02_text_image_pairs.md](../multimodal/02_text_image_pairs.md) for text+image
+3.  **Dynamic Batching**: Implement a dataloader that dynamically creates batches to maximize tokens-per-batch while staying under a GPU memory limit.
+
+4.  **Benchmark Tokenizers**: Compare the throughput of HuggingFace (slow/fast), tiktoken, and SentencePiece on your hardware.

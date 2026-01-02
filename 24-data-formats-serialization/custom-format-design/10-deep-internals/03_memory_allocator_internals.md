@@ -1,98 +1,485 @@
-# FFCV Memory Internals: The Zero-Copy Promise
+# FFCV Memory Internals: The Zero-Copy Architecture
 
-The term "Zero-Copy" is thrown around a lot. In FFCV, it means strictly: **Data is never copied from the OS Page Cache to User Space buffers until the very moment it is transformed.**
+## What "Zero-Copy" Really Means
 
-## The Read Path: `OSCacheManager`
+"Zero-copy" is often misused. In FFCV, it has a precise meaning:
 
-The `OSCacheManager` is the bridge between the raw file bytes and the JIT pipeline.
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                       ZERO-COPY DATA FLOW                                      │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  TRADITIONAL APPROACH (with copies):                                          │
+│  ───────────────────────────────────                                           │
+│                                                                                │
+│  ┌─────────┐  read()  ┌─────────┐  decode  ┌─────────┐  transform ┌─────────┐│
+│  │  Disk   │ ──────▶ │ Kernel  │ ──────▶ │  User   │ ──────────▶│ User    ││
+│  │  File   │  COPY 1  │ Buffer  │  COPY 2  │ Buffer  │   COPY 3   │ Output  ││
+│  └─────────┘         └─────────┘         └─────────┘            └─────────┘│
+│                                                                                │
+│  3 memory copies per sample!                                                  │
+│                                                                                │
+│                                                                                │
+│  FFCV ZERO-COPY APPROACH:                                                     │
+│  ────────────────────────                                                      │
+│                                                                                │
+│  ┌─────────┐  page   ┌─────────────────────────────────────────────────────┐ │
+│  │  Disk   │  fault  │   Page Cache (kernel memory mapped to user space)    │ │
+│  │  File   │ ──────▶│   ┌─────────────────────────────────────────────────┐ │ │
+│  └─────────┘         │   │  mmap view: direct pointer into file contents   │ │ │
+│                      │   │                                                  │ │ │
+│                      │   │   ┌──────┐          ┌──────────┐                │ │ │
+│                      │   │   │Sample│ ───┬───▶│ Decode   │                │ │ │
+│                      │   │   │ 0    │    │     │ (writes  │                │ │ │
+│                      │   │   └──────┘    │     │  directly│                │ │ │
+│                      │   │               │     │  to pre- │                │ │ │
+│                      │   │               │     │  alloc'd │                │ │ │
+│                      │   │               │     │  buffer) │                │ │ │
+│                      │   │               │     └────┬─────┘                │ │ │
+│                      │   │               │          │                      │ │ │
+│                      │   │               │          ▼                      │ │ │
+│                      │   │               │     ┌──────────┐                │ │ │
+│                      │   │               ◀────│ Pre-alloc│                │ │ │
+│                      │   │                     │ Output   |                │ │ │
+│                      │   │                     └──────────┘                │ │ │
+│                      │   └─────────────────────────────────────────────────┘ │ │
+│                      └─────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  Total copies: 1 (disk → page cache, done by OS/DMA)                          │
+│  Then: pointer passed to decoder, which writes directly to output buffer.    │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
 
-### 1. The State Tuple
-Passed to every JIT function is a state tuple: `(mmap_view, sorted_ptrs, sorted_sizes)`.
+## The Read Path: OSCacheManager
 
-*   `mmap_view`: A numpy memory map of the *entire* file as `uint8`.
-*   `sorted_ptrs`: Array of all data pointers in the file, sorted ascending.
-*   `sorted_sizes`: Corresponding sizes for those pointers.
+The `OSCacheManager` provides zero-copy access to file data using `mmap`.
 
-### 2. The `read` Function Algorithm
+### Memory-Mapped File Access
 
 ```python
-def read(address, mem_state):
-    mmap, ptrs, sizes = mem_state
+import numpy as np
+import mmap
+import os
+
+class OSCacheManager:
+    """
+    Memory manager that uses OS page cache for caching.
     
-    # 1. Find the index of the address in the sorted pointer list
-    #    Binary Search: O(log N)
-    idx = np.searchsorted(ptrs, address)
+    The file is memory-mapped, allowing direct access to file contents
+    as if they were in RAM. The OS handles paging data in/out.
+    """
     
-    # 2. Retrieve the size
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.file = open(file_path, 'rb')
+        self.file_size = os.path.getsize(file_path)
+        
+        # Memory-map the entire file
+        self.mm = mmap.mmap(
+            self.file.fileno(),
+            0,                      # 0 = entire file
+            access=mmap.ACCESS_READ
+        )
+        
+        # Create numpy view (no copy!)
+        self.mmap_view = np.frombuffer(self.mm, dtype=np.uint8)
+    
+    def load_allocation_table(self, header):
+        """
+        Load the allocation table into RAM for fast lookup.
+        
+        The allocation table maps sample IDs to (offset, size) pairs.
+        We load this once at startup, then use binary search for lookups.
+        """
+        table_offset = header['allocation_table_offset']
+        table_size = header['num_samples'] * 16  # 8 bytes offset + 8 bytes size
+        
+        # Read allocation table (this is the only "read" we do)
+        raw_table = self.mmap_view[table_offset:table_offset + table_size]
+        
+        # Parse into structured array
+        dtype = np.dtype([('offset', '<u8'), ('size', '<u8')])
+        self.alloc_table = np.frombuffer(raw_table, dtype=dtype)
+        
+        # Pre-sort for binary search (usually already sorted)
+        # Store separate arrays for Numba compatibility
+        self.sorted_offsets = self.alloc_table['offset'].copy()
+        self.sorted_sizes = self.alloc_table['size'].copy()
+    
+    @property
+    def state(self):
+        """
+        Return state tuple for JIT functions.
+        
+        This tuple is passed to all decoder functions, giving them
+        access to the memory-mapped file.
+        """
+        return (self.mmap_view, self.sorted_offsets, self.sorted_sizes)
+    
+    def close(self):
+        self.mm.close()
+        self.file.close()
+```
+
+### The Zero-Copy Read Function
+
+```python
+import numba as nb
+
+@nb.njit(nogil=True)
+def read_sample_data(sample_id: int, storage_state):
+    """
+    Read raw bytes for a sample without copying.
+    
+    This function is called from within JIT-compiled pipelines.
+    
+    Args:
+        sample_id: Index of sample to read.
+        storage_state: Tuple of (mmap_view, offsets, sizes).
+    
+    Returns:
+        Slice of mmap_view pointing to sample data (NO COPY).
+    """
+    mmap_view, offsets, sizes = storage_state
+    
+    # Get offset and size from pre-loaded table
+    offset = offsets[sample_id]
+    size = sizes[sample_id]
+    
+    # Return a VIEW into the mmap
+    # In Numba, this is just pointer arithmetic, no copy!
+    return mmap_view[offset:offset + size]
+
+
+@nb.njit(nogil=True)
+def read_by_pointer(ptr: int, storage_state):
+    """
+    Read raw bytes by direct pointer.
+    
+    Used when metadata contains the pointer directly.
+    """
+    mmap_view, offsets, sizes = storage_state
+    
+    # Binary search to find size
+    # O(log N) lookup
+    idx = nb.typed.searchsorted(offsets, ptr)
     size = sizes[idx]
     
-    # 3. Return a Slice (View)
-    return mmap[address : address + size]
+    return mmap_view[ptr:ptr + size]
 ```
 
-**Critical Implementation Detail**: In Numba, `array[start:end]` on a `uint8[::1]` array returns a **view**, not a copy. This means the returned variable is just a pointer to the address inside the OS file cache (mapped into virtual memory).
+### Why This Works
 
-### 3. Allocation Table
-
-To make step 1 work, FFCV must load the *entire* allocation table into RAM at startup. For a dataset with 10M samples, this is `10M * 8 bytes (ptr) + 10M * 8 bytes (size) ≈ 160MB`. This is negligible compared to the dataset size.
-
-## The Write Path: `PageAllocator`
-
-Writing efficiently is harder than reading. Naively appending data causes fragmentation and poor IOPS. FFCV uses **Page-Based Allocation**.
-
-### 1. The Page Concept
-Data is not written to the file immediately. It is collected into a buffer (a "Page"), typically 2MB or larger.
-
-```
-[ HEADER ] [ SPACE for 15 images ] [ ... ]
-```
-
-### 2. Parallel Writers, Serial Output
-To allow multi-threaded writing without file locking:
-1.  A worker thread requests a "Page" from the allocator.
-2.  The allocator assigns a file offset range (e.g., bits `100MB` to `102MB`) to that thread.
-3.  The thread fills this local buffer completely in RAM.
-4.  Once full, the thread asks for a new page.
-5.  The filled page is flushed to disk.
-
-**Benefit**: Large sequential writes are friendly to HDDs and SSDs. Small random writes are avoided.
-
-### 3. The `malloc` function
-
-Inside the `DatasetWriter`, fields receive a `malloc` callback.
+The key insight is that `mmap_view[offset:offset + size]` in Numba returns a **view**, not a copy:
 
 ```python
-def malloc(size):
-    # Check if current page has space
-    if current_page.remaining < size:
-        flush(current_page)
-        current_page = allocate_new_page()
-        
-    ptr = current_page.current_ptr
-    current_page.current_ptr += size
-    
-    # Return pointer into the BUFFER, not the file yet
-    return current_page_file_offset + ptr, current_page.buffer[ptr : ptr+size]
+# What happens at the machine level:
+
+# Python version (conceptual):
+data = mmap_view[100:200]  # Creates new array with copied data
+
+# Numba version (actual):
+data = mmap_view[100:200]  # Returns pointer: mmap_view.data + 100
+                           # Length: 100
+                           # NO COPY!
 ```
 
-## OS-Level Mechanics
+This is only true for contiguous (`C` or `F`) arrays in Numba's nopython mode.
 
-### Memory Mapping (`mmap`)
-`mmap` tells the kernel: "Map the file `data.beton` to the virtual address range `0x7f...` to `0x8f...`".
-*   **Initial State**: The range is valid but empty.
-*   **Access**: When `read()` accesses `mmap[ptr]`, the CPU raises a **Page Fault**.
-*   **Resolution**: The Kernel catches the fault, sees it's a mapped file, reads the 4KB block from disk into RAM (Page Cache), and resumes the process.
+## The Write Path: PageAllocator
 
-### `madvise` Hints
-FFCV (optionally) calls `madvise` to pre-trigger these page faults.
-*   `MADV_WILLNEED`: Triggers the read immediately (Prefetching).
-*   `MADV_SEQUENTIAL`: Tells OS to use aggressive readahead (good for linear scans).
-*   `MADV_RANDOM`: Tells OS to disable readahead (good for random sampling).
+Writing is more complex than reading because we need to:
+1. Support parallel writers
+2. Minimize random I/O
+3. Handle variable-size data
 
-## Alignment
+### Page-Based Allocation
 
-For maximum efficiency with Direct I/O (if used) and SSD block boundaries, FFCV attempts to align allocations.
-*   **4KB Alignment**: Matches standard OS page size.
-*   **512B Alignment**: Matches standard disk sector size.
+```python
+class PageAllocator:
+    """
+    Allocates space for samples in fixed-size pages.
+    
+    Architecture:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  File Layout                                                            │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │  [Header] [Metadata] [Alloc Table] [Page 0] [Page 1] [Page 2] ...       │
+    │                                    ▲        ▲        ▲                  │
+    │                                    │        │        │                  │
+    │                                 2 MB     2 MB     2 MB                  │
+    │                                each page is a contiguous block          │
+    └─────────────────────────────────────────────────────────────────────────┘
+    
+    Benefits:
+    - Large sequential writes (2 MB at a time)
+    - Parallel allocation (each thread gets its own page)
+    - Minimal fragmentation
+    """
+    
+    DEFAULT_PAGE_SIZE = 2 * 1024 * 1024  # 2 MB
+    
+    def __init__(
+        self,
+        output_path: str,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        alignment: int = 512,  # Align allocations to sector boundaries
+    ):
+        self.output_path = output_path
+        self.page_size = page_size
+        self.alignment = alignment
+        
+        self.file = open(output_path, 'r+b')
+        self.file.seek(0, 2)  # Seek to end
+        self.current_file_offset = self.file.tell()
+        
+        # Thread-local page buffers
+        import threading
+        self.local = threading.local()
+        
+        # Lock for allocating new pages
+        self.page_lock = threading.Lock()
+        
+        # Track all allocations for building the table
+        self.allocations = []  # List of (sample_id, offset, size)
+    
+    def _get_page(self) -> 'Page':
+        """Get the current thread's page, allocating if needed."""
+        if not hasattr(self.local, 'page') or self.local.page is None:
+            self.local.page = self._allocate_new_page()
+        return self.local.page
+    
+    def _allocate_new_page(self) -> 'Page':
+        """Allocate a new page (thread-safe)."""
+        with self.page_lock:
+            # Record the file offset for this page
+            page_offset = self.current_file_offset
+            self.current_file_offset += self.page_size
+            
+            return Page(
+                file_offset=page_offset,
+                size=self.page_size,
+                alignment=self.alignment,
+            )
+    
+    def malloc(self, size: int):
+        """
+        Allocate space for data.
+        
+        Args:
+            size: Number of bytes needed.
+        
+        Returns:
+            (file_offset, buffer_view) tuple.
+            file_offset: Where this data will be in the final file.
+            buffer_view: numpy array to write data into.
+        """
+        page = self._get_page()
+        
+        # Check if current page has space
+        if not page.can_allocate(size):
+            # Flush current page and get a new one
+            self._flush_page(page)
+            page = self._allocate_new_page()
+            self.local.page = page
+        
+        # Allocate within page
+        offset, view = page.allocate(size)
+        
+        # Calculate final file offset
+        file_offset = page.file_offset + offset
+        
+        return file_offset, view
+    
+    def _flush_page(self, page: 'Page'):
+        """Write a completed page to disk."""
+        with self.page_lock:
+            self.file.seek(page.file_offset)
+            self.file.write(page.buffer[:page.current_offset].tobytes())
+    
+    def finalize(self):
+        """Flush all remaining pages and close."""
+        # Flush thread-local pages
+        if hasattr(self.local, 'page') and self.local.page is not None:
+            self._flush_page(self.local.page)
+        
+        self.file.close()
 
-If a file format ignores alignment, `read()` calls might span two pages unnecessarily, triggering two page faults instead of one.
+
+class Page:
+    """A fixed-size buffer for accumulating data before writing."""
+    
+    def __init__(self, file_offset: int, size: int, alignment: int):
+        self.file_offset = file_offset
+        self.size = size
+        self.alignment = alignment
+        
+        self.buffer = np.zeros(size, dtype=np.uint8)
+        self.current_offset = 0
+    
+    def can_allocate(self, size: int) -> bool:
+        """Check if this page has room for `size` bytes."""
+        aligned_size = self._align(size)
+        return self.current_offset + aligned_size <= self.size
+    
+    def allocate(self, size: int):
+        """
+        Allocate space within this page.
+        
+        Returns (offset, view) where:
+        - offset is the position within this page
+        - view is a numpy array slice to write into
+        """
+        aligned_size = self._align(size)
+        
+        offset = self.current_offset
+        view = self.buffer[offset:offset + size]
+        
+        self.current_offset += aligned_size
+        
+        return offset, view
+    
+    def _align(self, size: int) -> int:
+        """Round up to alignment boundary."""
+        return ((size + self.alignment - 1) // self.alignment) * self.alignment
+```
+
+## Alignment Considerations
+
+Proper alignment is critical for performance:
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                       ALIGNMENT MATTERS                                        │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  MISALIGNED ACCESS:                                                           │
+│  ──────────────────                                                            │
+│                                                                                │
+│  Page Boundaries:    |────PAGE 0────|────PAGE 1────|                          │
+│                      0            4096           8192                         │
+│                                                                                │
+│  Sample Data:               [███████████████]                                 │
+│                             3900          4600                                 │
+│                                 ▲              ▲                              │
+│                                 │              │                              │
+│                              crosses page   boundary!                         │
+│                                                                                │
+│  Result: 2 page faults instead of 1                                          │
+│  Result: 2 disk reads instead of 1                                            │
+│                                                                                │
+│                                                                                │
+│  ALIGNED ACCESS:                                                              │
+│  ───────────────                                                               │
+│                                                                                │
+│  Page Boundaries:    |────PAGE 0────|────PAGE 1────|                          │
+│                      0            4096           8192                         │
+│                                                                                │
+│  Sample Data:        [███████████]                                            │
+│                      0          700                                           │
+│                                 ▲                                             │
+│                                 │                                             │
+│                              within one page                                  │
+│                                                                                │
+│  Result: 1 page fault, 1 disk read                                           │
+│                                                                                │
+│                                                                                │
+│  ALIGNMENT LEVELS:                                                            │
+│  ─────────────────                                                             │
+│                                                                                │
+│  Level           Size       Purpose                                           │
+│  ─────           ────       ───────                                           │
+│  CPU Cache Line  64 B       Avoid false sharing, prefetch efficiency         │
+│  Disk Sector     512 B      Direct I/O, SSD block alignment                  │
+│  OS Page         4 KB       Page fault granularity                           │
+│  Huge Page       2 MB       TLB efficiency for large datasets                │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Pre-Allocation: The Other Half of Zero-Copy
+
+Zero-copy reads are only half the story. We also need to avoid allocations during training:
+
+```python
+class BufferPool:
+    """
+    Pre-allocate all buffers needed for a training run.
+    
+    At pipeline setup time, we know:
+    - Batch size
+    - Output shapes for each pipeline stage
+    - Output dtypes
+    
+    We allocate all buffers ONCE and reuse them.
+    """
+    
+    def __init__(
+        self,
+        batch_size: int,
+        pipeline_shapes: dict,  # {'image': (224, 224, 3), 'label': ()}
+        pipeline_dtypes: dict,  # {'image': np.uint8, 'label': np.int64}
+    ):
+        self.batch_size = batch_size
+        self.buffers = {}
+        
+        for name, shape in pipeline_shapes.items():
+            dtype = pipeline_dtypes[name]
+            
+            # Allocate buffer for entire batch
+            full_shape = (batch_size,) + shape
+            self.buffers[name] = np.zeros(full_shape, dtype=dtype)
+    
+    def get_buffer(self, name: str) -> np.ndarray:
+        """Get the buffer for a pipeline stage."""
+        return self.buffers[name]
+    
+    def get_sample_slice(self, name: str, index: int) -> np.ndarray:
+        """Get a view into the buffer for a single sample."""
+        return self.buffers[name][index]
+```
+
+## The Complete Data Flow
+
+```python
+# At setup time:
+#   1. Memory-map the file
+#   2. Load allocation table
+#   3. Pre-allocate output buffers
+#   4. Compile the pipeline
+
+# At runtime (per batch):
+def load_batch(batch_indices, storage_state, buffers):
+    """
+    Load a batch with zero copies and zero allocations.
+    """
+    # This is the compiled JIT function
+    for i in range(len(batch_indices)):
+        sample_id = batch_indices[i]
+        
+        # Zero-copy: get VIEW into mmap
+        raw_data = read_sample_data(sample_id, storage_state)
+        
+        # Decode directly into pre-allocated buffer
+        # The decoder writes to buffers['image'][i] in-place
+        decode_jpeg(raw_data, buffers['image'][i])
+        
+        # Transform in-place
+        normalize(buffers['image'][i], buffers['image'][i])
+    
+    return buffers['image']  # Same array, now filled with data
+
+# Memory allocations during this loop: ZERO
+# Memory copies: 1 (disk → page cache, done by OS DMA)
+```
+
+## Exercises
+
+1.  **Benchmark Alignment Impact**: Write samples with 512B vs no alignment; measure random access latency.
+
+2.  **Implement Direct I/O**: Bypass the page cache entirely using `O_DIRECT` for writes.
+
+3.  **Memory Pool**: Implement a thread-safe page pool to avoid repeated allocations.
+
+4.  **Prefetching**: Implement `madvise(MADV_WILLNEED)` prefetching for the next batch.
