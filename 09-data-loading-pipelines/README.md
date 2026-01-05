@@ -18,6 +18,7 @@ data loading solution with profiling and multimodal support.
 
 | File | Description | Language |
 |------|-------------|----------|
+| `00_dataloader_fundamentals.md` | **START HERE!** Complete guide to DataLoader importance, bottlenecks, and internals | Markdown |
 | `01_dataloader_profiling.py` | Profile PyTorch DataLoader bottlenecks | Python |
 | `02_ffcv_webdataset_comparison.md` | Detailed FFCV vs WebDataset analysis | Markdown |
 | `03_dataloader_comparison.md` | **Complete comparison of ALL loaders** | Markdown |
@@ -31,7 +32,8 @@ data loading solution with profiling and multimodal support.
 
 ```
 Week 1: Fundamentals
-├── 01_dataloader_profiling.py    ← Start here! Find YOUR bottleneck
+├── 00_dataloader_fundamentals.md ← START HERE! Understand why DataLoader matters
+├── 01_dataloader_profiling.py    ← Find YOUR bottleneck
 ├── 03_dataloader_comparison.md   ← Understand all options
 └── 02_ffcv_webdataset_comparison.md
 
